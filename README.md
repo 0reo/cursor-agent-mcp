@@ -82,6 +82,32 @@ No. This server runs directly from the repository and is not published to npm (p
 If you later publish this as an npm package and add a `bin` entry in package.json, you could run it with `npx` and point your MCP host to that executable instead. Until then, prefer the Node-based command shown here.
 
 
+## As a Claude Code plugin
+
+The repo ships as a Claude Code plugin: `.claude-plugin/plugin.json` carries the metadata and `.mcp.json` declares the stdio server, so a single install registers all eleven tools (`chat`, `edit_file`, `analyze_files`, `search_repo`, `plan_task`, `list_models`, `list_sessions`, `start`, `poll`, `cancel`, `raw`) with one MCP entry.
+
+### Quick install (local clone)
+
+```bash
+git clone https://github.com/0reo/cursor-agent-mcp.git
+cd cursor-agent-mcp
+npm ci
+
+# Register manually if your host doesn't auto-discover .mcp.json:
+claude mcp add cursor-agent -s user \
+  -e CURSOR_AGENT_PATH=$(command -v cursor-agent) \
+  -e CURSOR_AGENT_MODEL=auto \
+  -e CURSOR_AGENT_IDLE_EXIT_MS=0 \
+  -- node "$(pwd)/server.js"
+```
+
+The bundled `.mcp.json` registers the server as type `stdio` with `node ./server.js`. Hosts that honor the plugin's MCP block (Claude Code via `/plugin install`, for example) pick it up automatically. Hosts that need an absolute path can use the explicit `claude mcp add` form above.
+
+### Environment substitution
+
+`.mcp.json` references three env defaults: `CURSOR_AGENT_PATH` (falls back to the `cursor-agent` binary on PATH), `CURSOR_AGENT_MODEL` (defaults to `auto`), and `CURSOR_AGENT_IDLE_EXIT_MS=0` (the recommended idle-kill disable so long generations don't get cut mid-stream). Override any of these in your host's plugin config or shell env to taste — full list under "Environment variables" in `CLAUDE.md`.
+
+
 ## Quick smoke test (without an MCP host)
 
 A tiny client is provided to list tools and call one of them over stdio:

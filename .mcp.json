@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "cursor-agent": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./server.js"],
+      "env": {
+        "CURSOR_AGENT_PATH": "${CURSOR_AGENT_PATH:-cursor-agent}",
+        "CURSOR_AGENT_MODEL": "${CURSOR_AGENT_MODEL:-auto}",
+        "CURSOR_AGENT_IDLE_EXIT_MS": "0"
+      }
+    }
+  }
+}

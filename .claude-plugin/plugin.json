@@ -1,0 +1,11 @@
+{
+  "name": "cursor-agent",
+  "version": "1.2.0",
+  "description": "MCP wrapper for the cursor-agent CLI. Exposes typed tools for chat / edit / analyze / search / plan / raw / list_models / list_sessions plus async start / poll / cancel for long calls that exceed the 60s MCP client timeout. Streams stdout via MCP progress notifications and captures session_ids into a local registry so headless workflows can resume prior chats.",
+  "author": {
+    "name": "0reo (fork of sailay1996/cursor-agent-mcp)"
+  },
+  "homepage": "https://github.com/0reo/cursor-agent-mcp",
+  "license": "MIT",
+  "keywords": ["cursor-agent", "mcp", "cursor", "agent", "headless"]
+}

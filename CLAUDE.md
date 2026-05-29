@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An **MCP server (`server.js`) that wraps the `cursor-agent` CLI** over stdio, exposing it as Claude-friendly tools — sync (chat / edit / analyze / search / plan / raw / list_models / list_sessions) and async (start / poll / cancel for long calls that exceed the 60s MCP client wall). It lets an MCP host (Claude Code) drive cursor-agent's headless print mode. Pure helpers live in `argv-builder.js`, session-registry I/O in `session-registry.js`, and the async job table in `jobs.js` (all imported by `server.js`) so logic can be unit-tested without spawning the binary. `private: true`, runs from the repo (not published to npm).
+An **MCP server (`server.js`) that wraps the `cursor-agent` CLI** over stdio, exposing it as Claude-friendly tools — sync (chat / edit / analyze / search / plan / raw / list_models / list_sessions) and async (start / poll / cancel for long calls that exceed the 60s MCP client wall). It lets an MCP host (Claude Code) drive cursor-agent's headless print mode. Pure helpers live in `argv-builder.js`, session-registry I/O in `session-registry.js`, and the async job table in `jobs.js` (all imported by `server.js`) so logic can be unit-tested without spawning the binary. Ships as a Claude Code plugin: `.claude-plugin/plugin.json` carries the metadata and `.mcp.json` declares the stdio server so a single install registers all eleven tools. `private: true`, runs from the repo (not published to npm).
 
 This is a fork: `origin` = `0reo/cursor-agent-mcp` (ours), `upstream` = `sailay1996/cursor-agent-mcp`. Enhancement work is tracked in **issues on the fork** (`gh issue list -R 0reo/cursor-agent-mcp`).
 
