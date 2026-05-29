@@ -28,7 +28,16 @@ export async function readRegistry(filePath) {
     if (e?.code === 'ENOENT') return EMPTY();
     if (e instanceof SyntaxError) {
       const backup = `${filePath}.corrupted.${Date.now()}`;
-      try { await fs.rename(filePath, backup); } catch {}
+      try {
+        await fs.rename(filePath, backup);
+      } catch (renameErr) {
+        // If the rename failed (read-only mount, EACCES, etc.) the next write
+        // will hit the same SyntaxError forever. Surface the diagnosis under
+        // DEBUG_CURSOR_MCP so an operator looking at logs sees what's wrong.
+        if (process.env.DEBUG_CURSOR_MCP === '1') {
+          try { console.error('[cursor-mcp] registry corruption at', filePath, 'rename to backup failed:', renameErr?.message || renameErr); } catch {}
+        }
+      }
       return EMPTY();
     }
     throw e;
@@ -70,8 +79,16 @@ export async function recordSession(entry, { env = process.env, home } = {}) {
       const reg = await readRegistry(filePath);
       const updated = upsertSessionEntry(reg, entry);
       await writeRegistry(filePath, updated);
-    } catch {
-      // best-effort — registry is a discovery convenience, not load-bearing
+    } catch (e) {
+      // best-effort — registry is a discovery convenience, not load-bearing.
+      // We don't re-throw filesystem errors (EACCES, ENOSPC, EROFS, EDQUOT)
+      // because the user's tool call should still succeed. But surface ALL
+      // errors under DEBUG so programmer bugs (TypeError from a bad entry,
+      // ReferenceError from a refactor) and silent-disk-full conditions
+      // aren't permanently invisible.
+      if (process.env.DEBUG_CURSOR_MCP === '1') {
+        try { console.error('[cursor-mcp] recordSession swallowed error:', e?.message || e); } catch {}
+      }
     }
   });
   writeQueues.set(filePath, next);

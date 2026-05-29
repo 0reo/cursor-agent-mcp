@@ -154,7 +154,11 @@ export function createJob(opts = {}, { spawnFn = defaultSpawn, resolveExecutable
     if (job.status !== 'running') return;
     job.status = 'timed_out';
     job.ended_at_ms = Date.now();
-    try { child.kill('SIGKILL'); } catch {}
+    // If SIGKILL on the tracked pid throws, we've orphaned cursor-agent —
+    // the operator needs to know so they can kill -9 by hand.
+    try { child.kill('SIGKILL'); } catch (e) {
+      try { console.error('[cursor-mcp] job', job_id, 'timeout SIGKILL failed:', e?.message || e); } catch {}
+    }
     scheduleCleanup(job_id);
   }, timeoutMs);
 
@@ -177,7 +181,12 @@ export function cancelJob(job_id) {
   job.status = 'cancelled';
   job.ended_at_ms = Date.now();
   clearTimeout(job.timer);
-  try { job.child?.kill('SIGTERM'); } catch {}
+  // SIGTERM failure on cancel deserves a stderr log: same orphan risk as the
+  // timeout-SIGKILL path. We don't escalate to SIGKILL here — the job is
+  // already marked cancelled; the close handler guards against status overwrite.
+  try { job.child?.kill('SIGTERM'); } catch (e) {
+    try { console.error('[cursor-mcp] job', job_id, 'cancel SIGTERM failed:', e?.message || e); } catch {}
+  }
   scheduleCleanup(job_id);
   return snapshot(job);
 }

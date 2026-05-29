@@ -43,17 +43,36 @@ const RUN_SCHEMA = z.object({
 function makeProgressDispatcher(extra) {
   const progressToken = extra?._meta?.progressToken;
   if (progressToken == null) return undefined;
-  // The MCP SDK enforces per-request notification scoping; we just hand the
-  // notification object over. Failures are swallowed so a flaky notification
-  // channel cannot crash the underlying cursor-agent call.
+  // Latch-on-first-failure: when the MCP channel disconnects mid-stream, every
+  // subsequent stdout chunk would otherwise re-fire a doomed sendNotification
+  // (hundreds per long call), each rejection silently swallowed. After the
+  // first failure we stop trying. DEBUG_CURSOR_MCP surfaces the latch event
+  // so a real channel problem doesn't go undiagnosed.
+  let dispatchDead = false;
   return (chunk, total_bytes) => {
+    if (dispatchDead) return;
     const notification = buildProgressNotification({
       progressToken,
       progress: total_bytes,
       message: chunk,
     });
-    if (notification && typeof extra.sendNotification === 'function') {
-      extra.sendNotification(notification).catch(() => {});
+    if (!notification || typeof extra.sendNotification !== 'function') return;
+    try {
+      const ret = extra.sendNotification(notification);
+      if (ret && typeof ret.catch === 'function') {
+        ret.catch((e) => {
+          dispatchDead = true;
+          if (process.env.DEBUG_CURSOR_MCP === '1') {
+            try { console.error('[cursor-mcp] progress dispatch failed, latching off:', e?.message || e); } catch {}
+          }
+        });
+      }
+    } catch (e) {
+      // sync throw (e.g., transport already torn down) — also latch
+      dispatchDead = true;
+      if (process.env.DEBUG_CURSOR_MCP === '1') {
+        try { console.error('[cursor-mcp] progress dispatch sync error, latching off:', e?.message || e); } catch {}
+      }
     }
   };
 }
@@ -128,7 +147,13 @@ async function invokeCursorAgent({
      // (tool handler) supplies onProgress only when a progressToken is present
      // on the request, so most calls pay no cost here.
      if (typeof onProgress === 'function') {
-       try { onProgress(chunk, out.length); } catch {}
+       try {
+         onProgress(chunk, out.length);
+       } catch (e) {
+         if (process.env.DEBUG_CURSOR_MCP === '1') {
+           try { console.error('[cursor-mcp] onProgress threw:', e?.message || e); } catch {}
+         }
+       }
      }
    });
 
@@ -151,7 +176,12 @@ async function invokeCursorAgent({
    });
 
    const mainTimer = setTimeout(() => {
-     try { child.kill('SIGKILL'); } catch {}
+     // Log a kill failure unconditionally — if SIGKILL on a tracked pid
+     // throws (EPERM, ESRCH-but-still-tracked), we've orphaned the child
+     // and the operator needs to know.
+     try { child.kill('SIGKILL'); } catch (e) {
+       try { console.error('[cursor-mcp] timeout SIGKILL failed for pid', child.pid, ':', e?.message || e); } catch {}
+     }
      if (settled) return;
      settled = true;
      cleanup();
