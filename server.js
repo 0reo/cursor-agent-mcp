@@ -17,6 +17,7 @@ import {
   resolveSessionRegistryPath,
   buildPromptArgv,
   buildJobPollResponse,
+  buildProgressNotification,
 } from './argv-builder.js';
 import { maybeRecordSession, loadRegistry } from './session-registry.js';
 import { createJob, getJob, cancelJob } from './jobs.js';
@@ -35,6 +36,28 @@ const RUN_SCHEMA = z.object({
   force: z.boolean().optional().describe('Write gate (Claude decides per call). true = allow cursor-agent to modify files and run shell on disk (--force). Omit/false = propose-only, read-only.'),
 });
 
+// Build an onProgress callback bound to the current MCP request's progressToken.
+// Returns undefined when the client did NOT request progress (no token) — that
+// way the spawn-side fast path stays branch-free for non-streaming callers.
+// Refs #7.
+function makeProgressDispatcher(extra) {
+  const progressToken = extra?._meta?.progressToken;
+  if (progressToken == null) return undefined;
+  // The MCP SDK enforces per-request notification scoping; we just hand the
+  // notification object over. Failures are swallowed so a flaky notification
+  // channel cannot crash the underlying cursor-agent call.
+  return (chunk, total_bytes) => {
+    const notification = buildProgressNotification({
+      progressToken,
+      progress: total_bytes,
+      message: chunk,
+    });
+    if (notification && typeof extra.sendNotification === 'function') {
+      extra.sendNotification(notification).catch(() => {});
+    }
+  };
+}
+
 // Resolve the executable path for cursor-agent
 function resolveExecutable(explicit) {
   if (explicit && explicit.trim()) return explicit.trim();
@@ -52,6 +75,7 @@ function resolveExecutable(explicit) {
 async function invokeCursorAgent({
   argv, output_format = 'text', cwd, executable, model, force, print = true, timeout_ms,
   workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
+  onProgress,
 }) {
  const cmd = resolveExecutable(executable);
  const finalArgv = buildFinalArgv({
@@ -97,8 +121,15 @@ async function invokeCursorAgent({
    };
 
    child.stdout.on('data', (d) => {
-     out += d.toString();
+     const chunk = d.toString();
+     out += chunk;
      scheduleIdleKill();
+     // Refs #7 — best-effort streaming via MCP progress notifications. Caller
+     // (tool handler) supplies onProgress only when a progressToken is present
+     // on the request, so most calls pay no cost here.
+     if (typeof onProgress === 'function') {
+       try { onProgress(chunk, out.length); } catch {}
+     }
    });
 
    child.stderr.on('data', (d) => {
@@ -190,6 +221,7 @@ async function runCursorAgent(input) {
     skip_worktree_setup,
     sandbox,
     trust,
+    onProgress,
   } = source || {};
 
   const argv = buildPromptArgv({ prompt, extra_args, mode, resume, continue_session });
@@ -211,6 +243,7 @@ async function runCursorAgent(input) {
   const result = await invokeCursorAgent({
     argv, output_format, cwd, executable, model, force, timeout_ms,
     workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
+    onProgress,
   });
  
   // Echo prompt either when env is set or when caller provided echo_prompt: true (if host forwards unknown args it's fine)
@@ -251,6 +284,7 @@ const server = new McpServer(
        '- cursor_agent_run: legacy single-shot chat (prompt as positional).',
        'Shared params: force (write gate, Claude-decided), mode (plan|ask — read-only; Debug/other TUI modes are NOT headless-available), resume (continue a specific chat id from a prior JSON result), continue_session (continue most recent), timeout_ms (per-call server hard timeout; default 300s).',
        'Successful results carry MCP structuredContent with at least { duration_ms }; with output_format:"json" they also surface { session_id, model, usage, result, raw } when present in cursor-agent\'s JSON.',
+       'Streaming: hosts that pass a progressToken in request _meta receive `notifications/progress` (params.progress = bytes streamed, params.message = a 256-char prefix of the latest stdout chunk). Streaming applies to all spawn-driven tools; async start/poll callers should poll instead.',
      ].join(' '),
  },
 );
@@ -361,8 +395,9 @@ server.tool(
   'cursor_agent_chat',
   'Chat with cursor-agent using a prompt and optional model/force/output_format.',
   CHAT_SCHEMA.shape,
-  async (args) => {
+  async (args, extra) => {
     try {
+      const onProgress = makeProgressDispatcher(extra);
       // Normalize prompt in case the host nests under "arguments"
       const prompt =
         (args && typeof args === 'object' && 'prompt' in args ? args.prompt : undefined) ??
@@ -371,6 +406,7 @@ server.tool(
       const flat = {
         ...(args && typeof args === 'object' && args.arguments && typeof args.arguments === 'object' ? args.arguments : args),
         prompt,
+        onProgress,
       };
 
       return await runCursorAgent(flat);
@@ -384,8 +420,9 @@ server.tool(
   'cursor_agent_edit_file',
   'Edit a file with an instruction. Prompt-based wrapper; no CLI subcommand required.',
   EDIT_FILE_SCHEMA.shape,
-  async (args) => {
+  async (args, extra) => {
     try {
+      const onProgress = makeProgressDispatcher(extra);
       const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const composedPrompt =
         `Edit the repository file:\n` +
@@ -394,7 +431,7 @@ server.tool(
         (apply ? `- Apply changes if safe.\n` : `- Propose a patch/diff without applying.\n`) +
         (dry_run ? `- Treat as dry-run; do not write to disk.\n` : ``) +
         (prompt ? `- Additional context: ${String(prompt)}\n` : ``);
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -405,15 +442,16 @@ server.tool(
   'cursor_agent_analyze_files',
   'Analyze one or more paths; optional prompt. Prompt-based wrapper.',
   ANALYZE_FILES_SCHEMA.shape,
-  async (args) => {
+  async (args, extra) => {
     try {
+      const onProgress = makeProgressDispatcher(extra);
       const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const list = Array.isArray(paths) ? paths : [paths];
       const composedPrompt =
         `Analyze the following paths in the repository:\n` +
         list.map((p) => `- ${String(p)}`).join('\n') + '\n' +
         (prompt ? `Additional prompt: ${String(prompt)}\n` : '');
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -424,8 +462,9 @@ server.tool(
   'cursor_agent_search_repo',
   'Search repository code with include/exclude patterns. Prompt-based wrapper.',
   SEARCH_REPO_SCHEMA.shape,
-  async (args) => {
+  async (args, extra) => {
     try {
+      const onProgress = makeProgressDispatcher(extra);
       const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const inc = include == null ? [] : (Array.isArray(include) ? include : [include]);
       const exc = exclude == null ? [] : (Array.isArray(exclude) ? exclude : [exclude]);
@@ -435,7 +474,7 @@ server.tool(
         (inc.length ? `- Include globs:\n${inc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         (exc.length ? `- Exclude globs:\n${exc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         `Return concise findings with file paths and line references.`;
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -446,8 +485,9 @@ server.tool(
   'cursor_agent_plan_task',
   'Generate a plan for a goal with optional constraints. Runs in read-only --mode plan by default (no edits); override via mode.',
   PLAN_TASK_SCHEMA.shape,
-  async (args) => {
+  async (args, extra) => {
     try {
+      const onProgress = makeProgressDispatcher(extra);
       const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const cons = constraints ?? [];
       const composedPrompt =
@@ -457,7 +497,7 @@ server.tool(
         `Provide a numbered list of actions.`;
       // Enforce real read-only Plan mode by default (caller may override mode explicitly).
       // This makes plan_task actually no-edit at the CLI level, not just a prompt asking for a plan.
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -592,11 +632,12 @@ server.tool(
  'cursor_agent_raw',
  'Advanced: provide raw argv array to pass after common flags (e.g., ["search","--query","foo"]).',
  RAW_SCHEMA.shape,
- async (args) => {
+ async (args, extra) => {
    try {
+     const onProgress = makeProgressDispatcher(extra);
      const { argv, output_format, cwd, executable, model, force, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
      // For raw calls we disable implicit --print to allow commands like "--help"
-     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
+     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
    } catch (e) {
      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
    }
@@ -608,9 +649,10 @@ server.tool(
  'cursor_agent_run',
  'Run cursor-agent with a prompt and desired output format (legacy single-shot).',
  RUN_SCHEMA.shape,
- async (args) => {
+ async (args, extra) => {
    try {
-     return await runCursorAgent(args);
+     const onProgress = makeProgressDispatcher(extra);
+     return await runCursorAgent({ ...args, onProgress });
    } catch (e) {
      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
    }

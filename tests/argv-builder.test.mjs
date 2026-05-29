@@ -16,6 +16,7 @@ import {
   buildPromptArgv,
   buildJobPollResponse,
   buildWorkspaceFlags,
+  buildProgressNotification,
 } from '../argv-builder.js';
 
 describe('buildSessionFlags', () => {
@@ -798,6 +799,49 @@ describe('buildWorkspaceFlags (Refs #5)', () => {
       }),
       ['--workspace', '/tmp/x', '-w', 'wt-1', '--worktree-base', 'main', '--skip-worktree-setup', '--sandbox', 'enabled', '--trust'],
     );
+  });
+});
+
+describe('buildProgressNotification (Refs #7)', () => {
+  it('returns null when progressToken is null/undefined (no-op)', () => {
+    assert.equal(buildProgressNotification({ progressToken: null, progress: 10 }), null);
+    assert.equal(buildProgressNotification({ progress: 10 }), null);
+  });
+
+  it('builds the canonical MCP progress notification shape', () => {
+    const n = buildProgressNotification({ progressToken: 'abc', progress: 42 });
+    assert.equal(n.method, 'notifications/progress');
+    assert.equal(n.params.progressToken, 'abc');
+    assert.equal(n.params.progress, 42);
+    assert.equal(n.params.total, undefined);
+    assert.equal(n.params.message, undefined);
+  });
+
+  it('accepts numeric progressToken (per MCP spec)', () => {
+    const n = buildProgressNotification({ progressToken: 17, progress: 1 });
+    assert.equal(n.params.progressToken, 17);
+  });
+
+  it('includes total when provided', () => {
+    const n = buildProgressNotification({ progressToken: 't', progress: 50, total: 100 });
+    assert.equal(n.params.total, 100);
+  });
+
+  it('includes message when provided', () => {
+    const n = buildProgressNotification({ progressToken: 't', progress: 1, message: 'streaming...' });
+    assert.equal(n.params.message, 'streaming...');
+  });
+
+  it('truncates message to the byte cap (regression guard against unbounded payloads)', () => {
+    const huge = 'x'.repeat(10_000);
+    const n = buildProgressNotification({ progressToken: 't', progress: 1, message: huge });
+    assert.ok(n.params.message.length <= 256, `message length ${n.params.message.length} exceeded cap`);
+    assert.match(n.params.message, /\.\.\.$/, 'expected ellipsis marker on truncation');
+  });
+
+  it('passes short messages through unchanged', () => {
+    const n = buildProgressNotification({ progressToken: 't', progress: 1, message: 'short' });
+    assert.equal(n.params.message, 'short');
   });
 });
 

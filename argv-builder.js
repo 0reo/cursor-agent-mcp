@@ -7,6 +7,34 @@
 import path from 'node:path';
 import os from 'node:os';
 
+// Maximum bytes of stdout we forward in a single progress-notification `message`.
+// MCP progress notifications are best kept small; long messages are truncated
+// with an ellipsis marker so the receiver can tell the cut happened.
+export const PROGRESS_MESSAGE_MAX = 256;
+
+// Build a MCP `notifications/progress` notification body. Returns null when no
+// progressToken is available (so the server can no-op without a branch in the
+// caller). Refs #7.
+export function buildProgressNotification({ progressToken, progress, total, message } = {}) {
+  if (progressToken == null) return null;
+  let safeMessage;
+  if (typeof message === 'string' && message.length > 0) {
+    safeMessage =
+      message.length > PROGRESS_MESSAGE_MAX
+        ? message.slice(0, PROGRESS_MESSAGE_MAX - 3) + '...'
+        : message;
+  }
+  return {
+    method: 'notifications/progress',
+    params: {
+      progressToken,
+      progress,
+      ...(total != null ? { total } : {}),
+      ...(safeMessage ? { message: safeMessage } : {}),
+    },
+  };
+}
+
 // Build flags for workspace/worktree/sandbox/trust selection. Refs #5.
 // Canonical emission order: --workspace, -w[/name], --worktree-base,
 // --skip-worktree-setup, --sandbox, --trust. Falsy / blank / invalid values
