@@ -55,6 +55,18 @@ Tool registration (via `server.tool` + zod schemas):
 
 `CURSOR_AGENT_PATH` (binary path), `CURSOR_AGENT_MODEL` (default model — use `auto`/`gpt-5.2`/`gpt-5.3-codex`; the README's `gpt-5` is stale), `CURSOR_AGENT_FORCE` (write default; leave unset = propose-only), `CURSOR_AGENT_TIMEOUT_MS` (server hard timeout), `CURSOR_AGENT_IDLE_EXIT_MS` (`0` recommended — prevents premature termination mid-generation), `CURSOR_AGENT_ECHO_PROMPT`, `DEBUG_CURSOR_MCP=1`.
 
+### Three layered timeouts
+
+A long cursor-agent call has to survive THREE independent timeouts. Knowing which one fired drives the fix.
+
+| Layer | Source | Default | Per-call override | On expiry |
+|---|---|---|---|---|
+| Idle-stream kill | `CURSOR_AGENT_IDLE_EXIT_MS` | `0` (disabled) | — | SIGKILLs child if no stdout for N ms; if any stdout was buffered, returns it as success |
+| **Server hard timeout** | **`CURSOR_AGENT_TIMEOUT_MS`** | **`300000` (5 min)** | **`timeout_ms` in `COMMON` schema** | SIGKILLs child; returns timeout message + any buffered partial stdout (`isError: true`) |
+| MCP client request timeout | MCP SDK constant (host-side) | `60000` (60s) | host-dependent (e.g. SDK `callTool` `{timeout}`) | Host gives up; server keeps running in the background until its own timeout fires |
+
+Precedence inside the server (`resolveTimeoutMs`): per-call `timeout_ms` > `CURSOR_AGENT_TIMEOUT_MS` env > `DEFAULT_TIMEOUT_MS` constant. Invalid values (NaN, ≤0, unparseable) fall through to the next layer. Issue #2 (async start/poll) is the structural fix for tasks longer than the MCP client wall.
+
 ## How it's consumed
 
 Registered with Claude Code at user scope via `claude mcp add cursor-agent -s user -e ... -- node <abs path>/server.js`. cursor-agent must be installed and authenticated (`cursor-agent status`); its models bill against the Cursor plan.

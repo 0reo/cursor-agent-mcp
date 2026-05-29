@@ -8,7 +8,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn } from 'node:child_process';
 import process from 'node:process';
 
-import { buildSessionFlags, buildFinalArgv } from './argv-builder.js';
+import { buildSessionFlags, buildFinalArgv, resolveTimeoutMs } from './argv-builder.js';
 
 // Tool input schema
 const RUN_SCHEMA = z.object({
@@ -38,9 +38,10 @@ function resolveExecutable(explicit) {
 * Internal executor that spawns cursor-agent with provided argv and common options.
 * Adds --print and --output-format, handles env/model/force, timeouts and idle kill.
 */
-async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true }) {
+async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true, timeout_ms }) {
  const cmd = resolveExecutable(executable);
  const finalArgv = buildFinalArgv({ argv, output_format, model, force, print });
+ const timeoutMs = resolveTimeoutMs({ timeout_ms });
 
  return new Promise((resolve) => {
    let settled = false;
@@ -100,18 +101,19 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
      resolve({ content: [{ type: 'text', text: msg }], isError: true });
    });
 
-   const defaultTimeout = 30000;
-   const timeoutMs = Number.parseInt(process.env.CURSOR_AGENT_TIMEOUT_MS || String(defaultTimeout), 10);
    const mainTimer = setTimeout(() => {
      try { child.kill('SIGKILL'); } catch {}
      if (settled) return;
      settled = true;
      cleanup();
+     // Preserve any partial stdout buffered before the kill — without this, callers
+     // see only the timeout message and lose any in-flight progress. Refs #9.
+     const partial = out ? `\n\nPartial output (${out.length} bytes):\n${out}` : '';
      resolve({
-       content: [{ type: 'text', text: `cursor-agent timed out after ${Number.isFinite(timeoutMs) ? timeoutMs : defaultTimeout}ms` }],
+       content: [{ type: 'text', text: `cursor-agent timed out after ${timeoutMs}ms${partial}` }],
        isError: true,
      });
-   }, Number.isFinite(timeoutMs) ? timeoutMs : defaultTimeout);
+   }, timeoutMs);
 
    child.on('close', (code) => {
      if (settled) return;
@@ -150,6 +152,7 @@ async function runCursorAgent(input) {
     mode,
     resume,
     continue_session,
+    timeout_ms,
   } = source || {};
 
   const sessionFlags = buildSessionFlags({ mode, resume, continue_session });
@@ -168,7 +171,7 @@ async function runCursorAgent(input) {
     } catch {}
   }
  
-  const result = await invokeCursorAgent({ argv, output_format, cwd, executable, model, force });
+  const result = await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, timeout_ms });
  
   // Echo prompt either when env is set or when caller provided echo_prompt: true (if host forwards unknown args it's fine)
   const echoEnabled = process.env.CURSOR_AGENT_ECHO_PROMPT === '1' || source?.echo_prompt === true;
@@ -224,6 +227,9 @@ const COMMON = {
  // SESSION CONTINUITY — resume a prior cursor conversation by id, or continue the most recent.
  resume: z.string().optional().describe('Resume a specific cursor chat by id (--resume <id>). Use the session_id returned in a prior call\'s JSON output to continue that exact conversation.'),
  continue_session: z.boolean().optional().describe('Continue the most recent cursor session (--continue). Prefer `resume` with an explicit id when you have one; if both are given, `resume` wins.'),
+ // PER-CALL HARD TIMEOUT (ms). Beats CURSOR_AGENT_TIMEOUT_MS env, which beats the 5-minute default.
+ // Use a SMALLER value for quick chats, a LARGER value for heavy analyze/edit calls. Refs #9.
+ timeout_ms: z.number().int().positive().optional().describe('Server hard-timeout in ms for this cursor-agent call. Beats CURSOR_AGENT_TIMEOUT_MS env. Default: 300000 (5 min). On timeout the child is SIGKILL-ed and any partial stdout collected so far is returned alongside the timeout message.'),
  // When true, the server will prepend the effective prompt to the tool output (useful for Claude debugging)
  echo_prompt: z.boolean().optional(),
 };
@@ -302,7 +308,7 @@ server.tool(
   EDIT_FILE_SCHEMA.shape,
   async (args) => {
     try {
-      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
+      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
       const composedPrompt =
         `Edit the repository file:\n` +
         `- File: ${String(file)}\n` +
@@ -310,7 +316,7 @@ server.tool(
         (apply ? `- Apply changes if safe.\n` : `- Propose a patch/diff without applying.\n`) +
         (dry_run ? `- Treat as dry-run; do not write to disk.\n` : ``) +
         (prompt ? `- Additional context: ${String(prompt)}\n` : ``);
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -323,13 +329,13 @@ server.tool(
   ANALYZE_FILES_SCHEMA.shape,
   async (args) => {
     try {
-      const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
+      const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
       const list = Array.isArray(paths) ? paths : [paths];
       const composedPrompt =
         `Analyze the following paths in the repository:\n` +
         list.map((p) => `- ${String(p)}`).join('\n') + '\n' +
         (prompt ? `Additional prompt: ${String(prompt)}\n` : '');
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -342,7 +348,7 @@ server.tool(
   SEARCH_REPO_SCHEMA.shape,
   async (args) => {
     try {
-      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
+      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
       const inc = include == null ? [] : (Array.isArray(include) ? include : [include]);
       const exc = exclude == null ? [] : (Array.isArray(exclude) ? exclude : [exclude]);
       const composedPrompt =
@@ -351,7 +357,7 @@ server.tool(
         (inc.length ? `- Include globs:\n${inc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         (exc.length ? `- Exclude globs:\n${exc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         `Return concise findings with file paths and line references.`;
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -364,7 +370,7 @@ server.tool(
   PLAN_TASK_SCHEMA.shape,
   async (args) => {
     try {
-      const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
+      const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
       const cons = constraints ?? [];
       const composedPrompt =
         `Create a step-by-step plan to accomplish the following goal:\n` +
@@ -373,7 +379,7 @@ server.tool(
         `Provide a numbered list of actions.`;
       // Enforce real read-only Plan mode by default (caller may override mode explicitly).
       // This makes plan_task actually no-edit at the CLI level, not just a prompt asking for a plan.
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -387,9 +393,9 @@ server.tool(
  RAW_SCHEMA.shape,
  async (args) => {
    try {
-     const { argv, output_format, cwd, executable, model, force } = args;
+     const { argv, output_format, cwd, executable, model, force, timeout_ms } = args;
      // For raw calls we disable implicit --print to allow commands like "--help"
-     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false });
+     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, timeout_ms });
    } catch (e) {
      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
    }

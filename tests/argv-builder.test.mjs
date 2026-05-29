@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildSessionFlags, buildFinalArgv } from '../argv-builder.js';
+import { buildSessionFlags, buildFinalArgv, resolveTimeoutMs } from '../argv-builder.js';
 
 describe('buildSessionFlags', () => {
   it('returns [] for empty input', () => {
@@ -190,6 +190,61 @@ describe('buildFinalArgv', () => {
     assert.deepEqual(
       buildFinalArgv({ argv: undefined, env: emptyEnv }),
       ['--print', '--output-format', 'text'],
+    );
+  });
+});
+
+describe('resolveTimeoutMs (Refs #9)', () => {
+  const emptyEnv = {};
+  const DEFAULT_MS = 300000;
+
+  it('returns the new 5-minute default (300000ms) when nothing is configured', () => {
+    assert.equal(resolveTimeoutMs({ env: emptyEnv }), DEFAULT_MS);
+    assert.equal(resolveTimeoutMs(), DEFAULT_MS > 0 ? resolveTimeoutMs() : DEFAULT_MS);
+  });
+
+  it('honors CURSOR_AGENT_TIMEOUT_MS env when per-call is absent', () => {
+    assert.equal(resolveTimeoutMs({ env: { CURSOR_AGENT_TIMEOUT_MS: '60000' } }), 60000);
+  });
+
+  it('per-call timeout_ms beats env', () => {
+    assert.equal(
+      resolveTimeoutMs({
+        timeout_ms: 120000,
+        env: { CURSOR_AGENT_TIMEOUT_MS: '60000' },
+      }),
+      120000,
+    );
+  });
+
+  it('per-call timeout_ms beats default', () => {
+    assert.equal(resolveTimeoutMs({ timeout_ms: 45000, env: emptyEnv }), 45000);
+  });
+
+  it('ignores invalid per-call values (NaN, 0, negative, non-number) and falls back', () => {
+    for (const bad of [Number.NaN, 0, -1, '60000', null, undefined, {}, []]) {
+      assert.equal(
+        resolveTimeoutMs({ timeout_ms: bad, env: { CURSOR_AGENT_TIMEOUT_MS: '60000' } }),
+        60000,
+        `bad per-call value ${String(bad)} should fall through to env`,
+      );
+    }
+  });
+
+  it('ignores garbage CURSOR_AGENT_TIMEOUT_MS values and falls back to default', () => {
+    for (const garbage of ['', 'abc', '0', '-100', 'NaN']) {
+      assert.equal(
+        resolveTimeoutMs({ env: { CURSOR_AGENT_TIMEOUT_MS: garbage } }),
+        DEFAULT_MS,
+        `garbage env value '${garbage}' should fall through to default`,
+      );
+    }
+  });
+
+  it('allows overriding default for callers that want a different baseline', () => {
+    assert.equal(
+      resolveTimeoutMs({ env: emptyEnv, defaultMs: 90000 }),
+      90000,
     );
   });
 });

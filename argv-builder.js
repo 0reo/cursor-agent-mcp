@@ -51,3 +51,30 @@ export function buildFinalArgv({
     ...(hasModelFlag || !effectiveModel ? [] : ['--model', effectiveModel]),
   ];
 }
+
+// Default server-side hard timeout (ms) for a synchronous cursor-agent call.
+// Raised from the original 30s to 5 minutes because real cursor-agent tasks
+// (multi-file edits, deep analysis, plan generation) routinely run longer.
+// Issue #2 (async start/poll) is the structural fix for tasks > MCP-client wall;
+// this is the short-term mitigation that prevents premature SIGKILL on the
+// common "task completes in 30–90s" case. Refs #9.
+export const DEFAULT_TIMEOUT_MS = 300000;
+
+// Resolve the effective hard-timeout for one cursor-agent invocation.
+// Precedence: per-call timeout_ms > CURSOR_AGENT_TIMEOUT_MS env > defaultMs.
+// Invalid values (NaN, ≤0, non-number for per-call; ≤0/unparseable for env) are ignored.
+export function resolveTimeoutMs({
+  timeout_ms,
+  env = process.env,
+  defaultMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+  if (typeof timeout_ms === 'number' && Number.isFinite(timeout_ms) && timeout_ms > 0) {
+    return timeout_ms;
+  }
+  const envRaw = env?.CURSOR_AGENT_TIMEOUT_MS;
+  if (envRaw != null && envRaw !== '') {
+    const envParsed = Number.parseInt(String(envRaw), 10);
+    if (Number.isFinite(envParsed) && envParsed > 0) return envParsed;
+  }
+  return defaultMs;
+}
