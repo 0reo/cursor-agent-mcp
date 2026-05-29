@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-file **MCP server (`server.js`) that wraps the `cursor-agent` CLI** over stdio, exposing it as Claude-friendly tools (chat / edit / analyze / search / plan / raw). It lets an MCP host (Claude Code) drive cursor-agent's headless print mode. `private: true`, runs from the repo (not published to npm).
+An **MCP server (`server.js`) that wraps the `cursor-agent` CLI** over stdio, exposing it as Claude-friendly tools (chat / edit / analyze / search / plan / raw). It lets an MCP host (Claude Code) drive cursor-agent's headless print mode. Pure argv/flag builders live in `argv-builder.js` (imported by `server.js`) so they can be unit-tested without spawning the binary. `private: true`, runs from the repo (not published to npm).
 
 This is a fork: `origin` = `0reo/cursor-agent-mcp` (ours), `upstream` = `sailay1996/cursor-agent-mcp`. Enhancement work is tracked in **issues on the fork** (`gh issue list -R 0reo/cursor-agent-mcp`).
 
@@ -13,11 +13,12 @@ This is a fork: `origin` = `0reo/cursor-agent-mcp` (ours), `upstream` = `sailay1
 ```bash
 npm ci                       # install deps (@modelcontextprotocol/sdk, zod)
 node --check server.js       # fast syntax check after edits
+npm run test:unit            # PREFERRED for iteration: pure unit tests via node:test (no spawn, no billing) — see tests/argv-builder.test.mjs
 node verify_modes.mjs        # E2E: mode:plan + resume round-trip (spawns a FRESH server; makes ~3 real cursor-agent calls — bills the Cursor plan)
 npm test                     # runs test_client.mjs — also a LIVE E2E that bills; not a unit test
 ```
 
-There are currently **no pure unit tests** (tracked: fork issue #6). The flag-building logic is pure and should be unit-tested without spawning cursor-agent.
+Unit tests for pure builders (`buildSessionFlags`, `buildFinalArgv`) live in `tests/argv-builder.test.mjs` and run via `node --test`. Every change to flag-emission logic should be testable here first; reach for `verify_modes.mjs` only when behavior depends on the actual cursor-agent runtime.
 
 Running the server standalone (normally a host spawns it):
 ```bash
@@ -27,9 +28,10 @@ DEBUG_CURSOR_MCP=1 ...        # logs the exact spawned argv + session/extra flag
 
 ## Architecture
 
-Two layers inside `server.js`:
+Two layers inside `server.js`, plus a pure-function sibling:
 
-- **`invokeCursorAgent({argv, output_format, model, force, print, ...})`** — the only place that spawns the binary (`spawn`, `shell:false`). Builds `finalArgv = [--print --output-format <fmt>, ...userArgs, (-f if force), (--model <m>)]`, then manages the main timeout (`CURSOR_AGENT_TIMEOUT_MS`) and idle kill (`CURSOR_AGENT_IDLE_EXIT_MS`). Resolves the executable via `resolveExecutable()` (explicit arg → `CURSOR_AGENT_PATH` → PATH).
+- **`argv-builder.js`** (pure, no I/O, no spawn) — exports `buildSessionFlags({mode, resume, continue_session})` and `buildFinalArgv({argv, output_format, model, force, print, env})`. Encapsulates every flag-emission rule (model precedence, force precedence, user-argv deduplication, print-format ordering). Test target for `tests/argv-builder.test.mjs`.
+- **`invokeCursorAgent({argv, output_format, model, force, print, ...})`** — the only place that spawns the binary (`spawn`, `shell:false`). Calls `buildFinalArgv` to assemble the argv, then manages the main timeout (`CURSOR_AGENT_TIMEOUT_MS`) and idle kill (`CURSOR_AGENT_IDLE_EXIT_MS`). Resolves the executable via `resolveExecutable()` (explicit arg → `CURSOR_AGENT_PATH` → PATH).
 - **`runCursorAgent(input)`** — assembles the prompt path: `argv = [...buildSessionFlags(...), ...extra_args, prompt]`, then calls `invokeCursorAgent`. Handles prompt echo. **All prompt-based tools funnel through here.**
 
 Tool registration (via `server.tool` + zod schemas):

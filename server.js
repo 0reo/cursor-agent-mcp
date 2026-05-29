@@ -8,6 +8,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn } from 'node:child_process';
 import process from 'node:process';
 
+import { buildSessionFlags, buildFinalArgv } from './argv-builder.js';
+
 // Tool input schema
 const RUN_SCHEMA = z.object({
   prompt: z.string().min(1, 'prompt is required'),
@@ -32,42 +34,13 @@ function resolveExecutable(explicit) {
   return 'cursor-agent';
 }
 
-// Build leading CLI flags for execution mode and session continuity.
-// resume (specific id) takes precedence over continue_session (most recent).
-function buildSessionFlags({ mode, resume, continue_session } = {}) {
-  const flags = [];
-  if (mode && String(mode).trim()) flags.push('--mode', String(mode).trim());
-  if (resume && String(resume).trim()) flags.push('--resume', String(resume).trim());
-  else if (continue_session) flags.push('--continue');
-  return flags;
-}
-
 /**
 * Internal executor that spawns cursor-agent with provided argv and common options.
 * Adds --print and --output-format, handles env/model/force, timeouts and idle kill.
 */
 async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true }) {
  const cmd = resolveExecutable(executable);
-
- // Compute model/force from args/env
- const userArgs = [...(argv ?? [])];
- const hasModelFlag = userArgs.some((a) => a === '-m' || a === '--model' || /^(?:-m=|--model=)/.test(String(a)));
- const envModel = process.env.CURSOR_AGENT_MODEL && process.env.CURSOR_AGENT_MODEL.trim();
- const effectiveModel = model?.trim?.() || envModel;
-
- const hasForceFlag = userArgs.some((a) => a === '-f' || a === '--force');
- const envForce = (() => {
-   const v = (process.env.CURSOR_AGENT_FORCE || '').toLowerCase();
-   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
- })();
- const effectiveForce = typeof force === 'boolean' ? force : envForce;
-
- const finalArgv = [
-   ...(print ? ['--print', '--output-format', output_format] : []),
-   ...userArgs,
-   ...(hasForceFlag || !effectiveForce ? [] : ['-f']),
-   ...(hasModelFlag || !effectiveModel ? [] : ['--model', effectiveModel]),
- ];
+ const finalArgv = buildFinalArgv({ argv, output_format, model, force, print });
 
  return new Promise((resolve) => {
    let settled = false;
