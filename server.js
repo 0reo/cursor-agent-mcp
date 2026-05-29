@@ -15,8 +15,11 @@ import {
   buildStructuredResult,
   parseModelList,
   resolveSessionRegistryPath,
+  buildPromptArgv,
+  buildJobPollResponse,
 } from './argv-builder.js';
-import { recordSession, loadRegistry } from './session-registry.js';
+import { maybeRecordSession, loadRegistry } from './session-registry.js';
+import { createJob, getJob, cancelJob } from './jobs.js';
 
 // Tool input schema
 const RUN_SCHEMA = z.object({
@@ -140,23 +143,11 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
          started_at_ms: startedAtMs,
          ended_at_ms: Date.now(),
        });
-       // Best-effort session capture: when stdout was JSON and yielded a
-       // session_id, persist it into the registry for later headless discovery.
-       // Fires and forgets — registry failures must NOT affect the tool result. Refs #1.
-       const sid = built.structuredContent?.session_id;
-       if (sid) {
-         const lastArg = Array.isArray(finalArgv) && finalArgv.length
-           ? String(finalArgv[finalArgv.length - 1])
-           : '';
-         const promptPreview = lastArg && !lastArg.startsWith('-')
-           ? lastArg.slice(0, 80)
-           : undefined;
-         recordSession({
-           session_id: sid,
-           model: built.structuredContent?.model,
-           prompt_preview: promptPreview,
-         }).catch(() => {});
-       }
+       // Best-effort session capture — shared with jobs.js via maybeRecordSession. Refs #1.
+       maybeRecordSession({
+         structuredContent: built.structuredContent,
+         finalArgv,
+       }).catch(() => {});
        resolve(built);
      } else {
        resolve({
@@ -189,9 +180,9 @@ async function runCursorAgent(input) {
     timeout_ms,
   } = source || {};
 
-  const sessionFlags = buildSessionFlags({ mode, resume, continue_session });
-  const argv = [...sessionFlags, ...(extra_args ?? []), String(prompt)];
+  const argv = buildPromptArgv({ prompt, extra_args, mode, resume, continue_session });
   const usedPrompt = argv.length ? String(argv[argv.length - 1]) : '';
+  const sessionFlags = buildSessionFlags({ mode, resume, continue_session });
 
   // Optional prompt echo and debug diagnostics
   if (process.env.DEBUG_CURSOR_MCP === '1') {
@@ -240,6 +231,7 @@ const server = new McpServer(
        '- cursor_agent_plan_task: read-only planning (enforces --mode plan by default) given a goal and optional constraints.',
        '- cursor_agent_list_models: list models advertised by the installed cursor-agent (`--list-models`); returns structuredContent.models = [{id, name}].',
        '- cursor_agent_list_sessions: list session_ids captured by this server (auto-recorded on output_format:"json" calls); structuredContent.sessions = [{session_id, first_seen_at, last_seen_at, model?, prompt_preview?}].',
+       '- cursor_agent_start / cursor_agent_poll / cursor_agent_cancel: async job pattern for calls that may exceed the 60s MCP client timeout. start returns { job_id } immediately; poll returns running/completed/failed/timed_out/cancelled state with partial_stdout; cancel SIGTERMs.',
        '- cursor_agent_raw: pass raw argv directly to cursor-agent; set print=false to avoid implicit --print. (Put --mode/--resume in argv yourself; typed mode/resume/continue_session are ignored here.)',
        '- cursor_agent_run: legacy single-shot chat (prompt as positional).',
        'Shared params: force (write gate, Claude-decided), mode (plan|ask — read-only; Debug/other TUI modes are NOT headless-available), resume (continue a specific chat id from a prior JSON result), continue_session (continue most recent), timeout_ms (per-call server hard timeout; default 300s).',
@@ -325,6 +317,22 @@ const LIST_MODELS_SCHEMA = z.object({
 
 // list_sessions takes no params — it reads the persistent registry on disk.
 const LIST_SESSIONS_SCHEMA = z.object({});
+
+// Async job tools — defeat the 60s MCP client timeout. Refs #2.
+// start takes the same shape as cursor_agent_chat but returns immediately
+// with a job_id; poll/cancel act on that handle.
+const START_SCHEMA = z.object({
+  prompt: z.string().min(1, 'prompt is required'),
+  ...COMMON,
+});
+
+const POLL_SCHEMA = z.object({
+  job_id: z.string().min(1, 'job_id is required'),
+});
+
+const CANCEL_SCHEMA = z.object({
+  job_id: z.string().min(1, 'job_id is required'),
+});
 
 // Tools
 server.tool(
@@ -491,6 +499,63 @@ server.tool(
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
   },
+);
+
+// Async start/poll/cancel — defeats the 60s MCP client timeout. Refs #2.
+// cursor_agent_start spawns the child and returns a job_id without awaiting.
+// cursor_agent_poll reads the current job state (running/completed/failed/
+// timed_out/cancelled) and returns either a partial-stdout snapshot or the
+// final result. cursor_agent_cancel SIGTERMs the child.
+server.tool(
+  'cursor_agent_start',
+  'Start an async cursor-agent call. Returns immediately with { job_id, status:"running" } — does NOT wait for completion. Use cursor_agent_poll(job_id) to check progress and collect the result; use cursor_agent_cancel(job_id) to abort. Same params as cursor_agent_chat. Designed to outlive the 60s MCP client request timeout.',
+  START_SCHEMA.shape,
+  async (args) => {
+    try {
+      const source = (args && typeof args === 'object' && args.arguments && typeof args.arguments === 'object')
+        ? args.arguments
+        : args;
+      const {
+        prompt, output_format = 'text', extra_args, cwd, executable, model, force,
+        mode, resume, continue_session, timeout_ms,
+      } = source || {};
+      const argv = buildPromptArgv({ prompt, extra_args, mode, resume, continue_session });
+      const job_id = createJob({
+        argv,
+        output_format,
+        cwd,
+        executable,
+        model,
+        force,
+        timeout_ms,
+      });
+      const job = getJob(job_id);
+      return {
+        content: [{ type: 'text', text: `Started job ${job_id} (poll with cursor_agent_poll).` }],
+        structuredContent: {
+          job_id,
+          status: job?.status ?? 'unknown',
+          started_at_ms: job?.started_at_ms,
+        },
+      };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'cursor_agent_poll',
+  'Poll an async job started by cursor_agent_start. Returns the current state — running (with partial_stdout + elapsed_ms), completed (with the full result and structured fields), failed/timed_out/cancelled (with isError). Safe to call repeatedly; terminal-state jobs are retained for 30 minutes.',
+  POLL_SCHEMA.shape,
+  async ({ job_id }) => buildJobPollResponse(getJob(job_id)),
+);
+
+server.tool(
+  'cursor_agent_cancel',
+  'Cancel an async job started by cursor_agent_start. SIGTERMs the child if still running and marks the job cancelled. Idempotent on terminal-state jobs.',
+  CANCEL_SCHEMA.shape,
+  async ({ job_id }) => buildJobPollResponse(cancelJob(job_id) ?? getJob(job_id)),
 );
 
 // Raw escape hatch for power-users and forward compatibility

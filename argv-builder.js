@@ -134,6 +134,82 @@ export function buildStructuredResult({
   };
 }
 
+// Assemble the argv that a prompt-based cursor-agent call hands to the
+// CLI body (after the leading --print/--output-format that buildFinalArgv
+// adds). Layout: [...sessionFlags, ...extra_args, prompt]. Refs #2.
+export function buildPromptArgv({ prompt, extra_args, mode, resume, continue_session } = {}) {
+  const sessionFlags = buildSessionFlags({ mode, resume, continue_session });
+  return [...sessionFlags, ...(extra_args ?? []), String(prompt ?? '')];
+}
+
+// Translate a job entry (see jobs.js) into the MCP tool result shape that
+// cursor_agent_poll / cursor_agent_cancel return. Pure — depends only on
+// the job snapshot, not on any global state. Refs #2.
+export function buildJobPollResponse(job) {
+  if (!job) {
+    return {
+      content: [{ type: 'text', text: 'Unknown job_id (may have expired or never existed)' }],
+      isError: true,
+    };
+  }
+  const { job_id, status, stdout = '', stderr = '', output_format = 'text', started_at_ms, ended_at_ms, exit_code, error } = job;
+  const duration_ms =
+    typeof started_at_ms === 'number' && typeof ended_at_ms === 'number'
+      ? Math.max(0, ended_at_ms - started_at_ms)
+      : null;
+
+  if (status === 'running') {
+    const elapsed_ms = typeof started_at_ms === 'number' ? Math.max(0, Date.now() - started_at_ms) : null;
+    return {
+      content: [{ type: 'text', text: `Job ${job_id} running (${stdout.length} bytes stdout buffered, ${elapsed_ms ?? '?'}ms elapsed).` }],
+      structuredContent: { job_id, status: 'running', partial_stdout: stdout, elapsed_ms },
+    };
+  }
+
+  if (status === 'completed') {
+    const built = buildStructuredResult({
+      stdout, output_format, started_at_ms, ended_at_ms,
+    });
+    return {
+      content: built.content,
+      structuredContent: { ...built.structuredContent, job_id, status: 'completed' },
+    };
+  }
+
+  if (status === 'timed_out') {
+    const partial = stdout ? `\n\nPartial output (${stdout.length} bytes):\n${stdout}` : '';
+    return {
+      content: [{ type: 'text', text: `Job ${job_id} timed out${partial}` }],
+      isError: true,
+      structuredContent: { job_id, status: 'timed_out', partial_stdout: stdout, duration_ms },
+    };
+  }
+
+  if (status === 'cancelled') {
+    return {
+      content: [{ type: 'text', text: `Job ${job_id} cancelled (${stdout.length} bytes stdout buffered before cancel).` }],
+      structuredContent: { job_id, status: 'cancelled', partial_stdout: stdout, duration_ms },
+    };
+  }
+
+  // failed (spawn error OR non-zero exit)
+  const text = error
+    ? `Job ${job_id} failed: ${error}`
+    : `Job ${job_id} exited with code ${exit_code}\n${stderr || stdout || '(no output)'}`;
+  return {
+    content: [{ type: 'text', text }],
+    isError: true,
+    structuredContent: {
+      job_id,
+      status: 'failed',
+      exit_code: exit_code ?? null,
+      error: error ?? null,
+      partial_stdout: stdout,
+      duration_ms,
+    },
+  };
+}
+
 // Resolve the on-disk path for the persistent session registry.
 // Precedence: CURSOR_AGENT_MCP_STATE_DIR env (explicit) >
 //             $XDG_STATE_HOME/cursor-agent-mcp >

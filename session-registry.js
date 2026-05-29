@@ -63,3 +63,23 @@ export async function loadRegistry({ env = process.env, home } = {}) {
   const filePath = resolveSessionRegistryPath({ env, home });
   return readRegistry(filePath);
 }
+
+// Convenience hook used by both invokeCursorAgent and the async jobs.js
+// completion handler: if a structured result carried a session_id, persist
+// it to the registry with a prompt_preview derived from the trailing
+// non-flag entry of finalArgv. Best-effort — never throws.
+export async function maybeRecordSession({ structuredContent, finalArgv } = {}) {
+  const sid = structuredContent?.session_id;
+  if (!sid) return;
+  const lastArg =
+    Array.isArray(finalArgv) && finalArgv.length
+      ? String(finalArgv[finalArgv.length - 1])
+      : '';
+  const prompt_preview =
+    lastArg && !lastArg.startsWith('-') ? lastArg.slice(0, 80) : undefined;
+  await recordSession({
+    session_id: sid,
+    model: structuredContent?.model,
+    prompt_preview,
+  });
+}

@@ -13,6 +13,8 @@ import {
   parseModelList,
   resolveSessionRegistryPath,
   upsertSessionEntry,
+  buildPromptArgv,
+  buildJobPollResponse,
 } from '../argv-builder.js';
 
 describe('buildSessionFlags', () => {
@@ -547,5 +549,165 @@ describe('upsertSessionEntry (Refs #1)', () => {
     );
     assert.equal(out.version, 1);
     assert.deepEqual(out.meta, { foo: 'bar' });
+  });
+});
+
+describe('buildPromptArgv (Refs #2)', () => {
+  it('composes [sessionFlags, ...extra_args, prompt]', () => {
+    const argv = buildPromptArgv({
+      prompt: 'hello',
+      mode: 'plan',
+      extra_args: ['--foo', 'bar'],
+    });
+    assert.deepEqual(argv, ['--mode', 'plan', '--foo', 'bar', 'hello']);
+  });
+
+  it('no session flags, no extra args, just the prompt', () => {
+    assert.deepEqual(buildPromptArgv({ prompt: 'hi' }), ['hi']);
+  });
+
+  it('coerces non-string prompt to string', () => {
+    assert.deepEqual(buildPromptArgv({ prompt: 42 }), ['42']);
+  });
+
+  it('handles undefined extra_args', () => {
+    assert.deepEqual(
+      buildPromptArgv({ prompt: 'hi', resume: 'abc' }),
+      ['--resume', 'abc', 'hi'],
+    );
+  });
+});
+
+describe('buildJobPollResponse (Refs #2)', () => {
+  it('null job → isError unknown', () => {
+    const r = buildJobPollResponse(null);
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /Unknown job_id/);
+  });
+
+  it('running job → status running, partial_stdout, elapsed_ms', () => {
+    const job = {
+      job_id: 'j1',
+      status: 'running',
+      stdout: 'in-progress text',
+      stderr: '',
+      output_format: 'text',
+      started_at_ms: Date.now() - 250,
+      ended_at_ms: null,
+    };
+    const r = buildJobPollResponse(job);
+    assert.equal(r.structuredContent.status, 'running');
+    assert.equal(r.structuredContent.partial_stdout, 'in-progress text');
+    assert.ok(r.structuredContent.elapsed_ms >= 0);
+    assert.equal(r.isError, undefined);
+  });
+
+  it('completed text job → content has stdout, structuredContent has status completed + duration', () => {
+    const job = {
+      job_id: 'j2',
+      status: 'completed',
+      stdout: 'final output',
+      stderr: '',
+      output_format: 'text',
+      started_at_ms: 1000,
+      ended_at_ms: 1500,
+      exit_code: 0,
+    };
+    const r = buildJobPollResponse(job);
+    assert.equal(r.content[0].text, 'final output');
+    assert.equal(r.structuredContent.status, 'completed');
+    assert.equal(r.structuredContent.duration_ms, 500);
+    assert.equal(r.structuredContent.job_id, 'j2');
+  });
+
+  it('completed json job → surfaces session_id + duration', () => {
+    const job = {
+      job_id: 'j3',
+      status: 'completed',
+      stdout: JSON.stringify({ session_id: 'sess-1', model: 'auto' }),
+      stderr: '',
+      output_format: 'json',
+      started_at_ms: 0,
+      ended_at_ms: 100,
+      exit_code: 0,
+    };
+    const r = buildJobPollResponse(job);
+    assert.equal(r.structuredContent.session_id, 'sess-1');
+    assert.equal(r.structuredContent.model, 'auto');
+    assert.equal(r.structuredContent.status, 'completed');
+  });
+
+  it('timed_out job → isError, partial_stdout preserved', () => {
+    const job = {
+      job_id: 'j4',
+      status: 'timed_out',
+      stdout: 'partial...',
+      stderr: '',
+      output_format: 'text',
+      started_at_ms: 0,
+      ended_at_ms: 1000,
+      exit_code: null,
+    };
+    const r = buildJobPollResponse(job);
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.status, 'timed_out');
+    assert.equal(r.structuredContent.partial_stdout, 'partial...');
+    assert.match(r.content[0].text, /timed out/i);
+    assert.match(r.content[0].text, /partial\.\.\./);
+  });
+
+  it('cancelled job → not isError, status cancelled', () => {
+    const job = {
+      job_id: 'j5',
+      status: 'cancelled',
+      stdout: 'some output before cancel',
+      stderr: '',
+      output_format: 'text',
+      started_at_ms: 0,
+      ended_at_ms: 200,
+      exit_code: null,
+    };
+    const r = buildJobPollResponse(job);
+    assert.equal(r.isError, undefined);
+    assert.equal(r.structuredContent.status, 'cancelled');
+    assert.equal(r.structuredContent.partial_stdout, 'some output before cancel');
+  });
+
+  it('failed job (nonzero exit) → isError with exit_code and stderr in text', () => {
+    const job = {
+      job_id: 'j6',
+      status: 'failed',
+      stdout: '',
+      stderr: 'something went wrong',
+      output_format: 'text',
+      started_at_ms: 0,
+      ended_at_ms: 50,
+      exit_code: 2,
+      error: null,
+    };
+    const r = buildJobPollResponse(job);
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.status, 'failed');
+    assert.equal(r.structuredContent.exit_code, 2);
+    assert.match(r.content[0].text, /something went wrong/);
+  });
+
+  it('failed job (spawn error) → isError with error message', () => {
+    const job = {
+      job_id: 'j7',
+      status: 'failed',
+      stdout: '',
+      stderr: '',
+      output_format: 'text',
+      started_at_ms: 0,
+      ended_at_ms: 5,
+      exit_code: null,
+      error: 'ENOENT: missing binary',
+    };
+    const r = buildJobPollResponse(job);
+    assert.equal(r.isError, true);
+    assert.equal(r.structuredContent.status, 'failed');
+    assert.equal(r.structuredContent.error, 'ENOENT: missing binary');
+    assert.match(r.content[0].text, /ENOENT/);
   });
 });
