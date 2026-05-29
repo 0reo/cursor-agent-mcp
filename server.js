@@ -18,7 +18,8 @@ const RUN_SCHEMA = z.object({
   executable: z.string().optional(),
   // Optional model and force for parity with other tools/env overrides
   model: z.string().optional(),
-  force: z.boolean().optional(),
+  // WRITE GATE — Claude decides per call. true => allow disk writes/shell (--force); omit/false => propose-only.
+  force: z.boolean().optional().describe('Write gate (Claude decides per call). true = allow cursor-agent to modify files and run shell on disk (--force). Omit/false = propose-only, read-only.'),
 });
 
 // Resolve the executable path for cursor-agent
@@ -29,6 +30,16 @@ function resolveExecutable(explicit) {
   }
   // default assumes "cursor-agent" is on PATH
   return 'cursor-agent';
+}
+
+// Build leading CLI flags for execution mode and session continuity.
+// resume (specific id) takes precedence over continue_session (most recent).
+function buildSessionFlags({ mode, resume, continue_session } = {}) {
+  const flags = [];
+  if (mode && String(mode).trim()) flags.push('--mode', String(mode).trim());
+  if (resume && String(resume).trim()) flags.push('--resume', String(resume).trim());
+  else if (continue_session) flags.push('--continue');
+  return flags;
 }
 
 /**
@@ -55,7 +66,7 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
    ...(print ? ['--print', '--output-format', output_format] : []),
    ...userArgs,
    ...(hasForceFlag || !effectiveForce ? [] : ['-f']),
-   ...(hasModelFlag || !effectiveModel ? [] : ['-m', effectiveModel]),
+   ...(hasModelFlag || !effectiveModel ? [] : ['--model', effectiveModel]),
  ];
 
  return new Promise((resolve) => {
@@ -163,16 +174,21 @@ async function runCursorAgent(input) {
     executable,
     model,
     force,
+    mode,
+    resume,
+    continue_session,
   } = source || {};
 
-  const argv = [...(extra_args ?? []), String(prompt)];
+  const sessionFlags = buildSessionFlags({ mode, resume, continue_session });
+  const argv = [...sessionFlags, ...(extra_args ?? []), String(prompt)];
   const usedPrompt = argv.length ? String(argv[argv.length - 1]) : '';
- 
+
   // Optional prompt echo and debug diagnostics
   if (process.env.DEBUG_CURSOR_MCP === '1') {
     try {
       const preview = usedPrompt.slice(0, 400).replace(/\n/g, '\\n');
       console.error('[cursor-mcp] prompt:', preview);
+      if (sessionFlags.length) console.error('[cursor-mcp] session flags:', JSON.stringify(sessionFlags));
       if (extra_args?.length) console.error('[cursor-mcp] extra_args:', JSON.stringify(extra_args));
       if (model) console.error('[cursor-mcp] model:', model);
       if (typeof force === 'boolean') console.error('[cursor-mcp] force:', String(force));
@@ -211,9 +227,10 @@ const server = new McpServer(
        '- cursor_agent_edit_file: prompt-based file edit wrapper; you provide file and instruction.',
        '- cursor_agent_analyze_files: prompt-based analysis of one or more paths.',
        '- cursor_agent_search_repo: prompt-based code search with include/exclude globs.',
-       '- cursor_agent_plan_task: prompt-based planning given a goal and optional constraints.',
-       '- cursor_agent_raw: pass raw argv directly to cursor-agent; set print=false to avoid implicit --print.',
+       '- cursor_agent_plan_task: read-only planning (enforces --mode plan by default) given a goal and optional constraints.',
+       '- cursor_agent_raw: pass raw argv directly to cursor-agent; set print=false to avoid implicit --print. (Put --mode/--resume in argv yourself; typed mode/resume/continue_session are ignored here.)',
        '- cursor_agent_run: legacy single-shot chat (prompt as positional).',
+       'Shared params: force (write gate, Claude-decided), mode (plan|ask — read-only; Debug/other TUI modes are NOT headless-available), resume (continue a specific chat id from a prior JSON result), continue_session (continue most recent).',
      ].join(' '),
  },
 );
@@ -225,7 +242,15 @@ const COMMON = {
  cwd: z.string().optional(),
  executable: z.string().optional(),
  model: z.string().optional(),
- force: z.boolean().optional(),
+ // WRITE GATE — Claude decides per call. true => cursor-agent may modify files / run shell on disk (adds --force/-f).
+ // Omit or false => read-only: changes are PROPOSED, not applied. Env default (CURSOR_AGENT_FORCE) is propose-only.
+ // Set true ONLY when the task's intent is to actually change the workspace; leave unset for chat/analyze/search/plan.
+ force: z.boolean().optional().describe('Write gate (Claude decides per call). true = allow cursor-agent to modify files and run shell on disk (--force). Omit/false = propose-only, read-only. Set true ONLY when the task intends to change the workspace.'),
+ // EXECUTION MODE — headless cursor-agent only supports plan|ask (Debug/Agent-wheel are TUI-only, unavailable here).
+ mode: z.enum(['plan', 'ask']).optional().describe('Cursor execution mode (--mode). plan = read-only planning, NO edits (enforced by cursor-agent). ask = read-only Q&A/explanation. Omit = default agent mode (can act/edit subject to force). Note: Debug and other interactive-TUI modes are NOT available headless.'),
+ // SESSION CONTINUITY — resume a prior cursor conversation by id, or continue the most recent.
+ resume: z.string().optional().describe('Resume a specific cursor chat by id (--resume <id>). Use the session_id returned in a prior call\'s JSON output to continue that exact conversation.'),
+ continue_session: z.boolean().optional().describe('Continue the most recent cursor session (--continue). Prefer `resume` with an explicit id when you have one; if both are given, `resume` wins.'),
  // When true, the server will prepend the effective prompt to the tool output (useful for Claude debugging)
  echo_prompt: z.boolean().optional(),
 };
@@ -239,8 +264,10 @@ const CHAT_SCHEMA = z.object({
 const EDIT_FILE_SCHEMA = z.object({
  file: z.string().min(1, 'file is required'),
  instruction: z.string().min(1, 'instruction is required'),
- apply: z.boolean().optional(),
- dry_run: z.boolean().optional(),
+ // NOTE: apply/dry_run are prompt HINTS only (composed into the instruction text). The ACTUAL disk write
+ // is gated by `force` below — set force:true to truly apply edits, regardless of apply/dry_run.
+ apply: z.boolean().optional().describe('Prompt hint asking the agent to apply changes. Does NOT itself write to disk — set force:true for an actual write.'),
+ dry_run: z.boolean().optional().describe('Prompt hint to treat as dry-run (no writes). For a guaranteed no-write, also omit/false force.'),
  // optional free-form prompt to pass if the CLI supports one
  prompt: z.string().optional(),
  ...COMMON,
@@ -302,7 +329,7 @@ server.tool(
   EDIT_FILE_SCHEMA.shape,
   async (args) => {
     try {
-      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args } = args;
+      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
       const composedPrompt =
         `Edit the repository file:\n` +
         `- File: ${String(file)}\n` +
@@ -310,7 +337,7 @@ server.tool(
         (apply ? `- Apply changes if safe.\n` : `- Propose a patch/diff without applying.\n`) +
         (dry_run ? `- Treat as dry-run; do not write to disk.\n` : ``) +
         (prompt ? `- Additional context: ${String(prompt)}\n` : ``);
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -323,13 +350,13 @@ server.tool(
   ANALYZE_FILES_SCHEMA.shape,
   async (args) => {
     try {
-      const { paths, prompt, output_format, cwd, executable, model, force, extra_args } = args;
+      const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
       const list = Array.isArray(paths) ? paths : [paths];
       const composedPrompt =
         `Analyze the following paths in the repository:\n` +
         list.map((p) => `- ${String(p)}`).join('\n') + '\n' +
         (prompt ? `Additional prompt: ${String(prompt)}\n` : '');
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -342,7 +369,7 @@ server.tool(
   SEARCH_REPO_SCHEMA.shape,
   async (args) => {
     try {
-      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args } = args;
+      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
       const inc = include == null ? [] : (Array.isArray(include) ? include : [include]);
       const exc = exclude == null ? [] : (Array.isArray(exclude) ? exclude : [exclude]);
       const composedPrompt =
@@ -351,7 +378,7 @@ server.tool(
         (inc.length ? `- Include globs:\n${inc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         (exc.length ? `- Exclude globs:\n${exc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         `Return concise findings with file paths and line references.`;
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -360,18 +387,20 @@ server.tool(
 
 server.tool(
   'cursor_agent_plan_task',
-  'Generate a plan for a goal with optional constraints. Prompt-based wrapper.',
+  'Generate a plan for a goal with optional constraints. Runs in read-only --mode plan by default (no edits); override via mode.',
   PLAN_TASK_SCHEMA.shape,
   async (args) => {
     try {
-      const { goal, constraints, output_format, cwd, executable, model, force, extra_args } = args;
+      const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session } = args;
       const cons = constraints ?? [];
       const composedPrompt =
         `Create a step-by-step plan to accomplish the following goal:\n` +
         `- Goal: ${String(goal)}\n` +
         (cons.length ? `- Constraints:\n${cons.map((c)=>`  - ${String(c)}`).join('\n')}\n` : '') +
         `Provide a numbered list of actions.`;
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force });
+      // Enforce real read-only Plan mode by default (caller may override mode explicitly).
+      // This makes plan_task actually no-edit at the CLI level, not just a prompt asking for a plan.
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
