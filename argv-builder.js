@@ -1,6 +1,11 @@
-// Pure functions for building cursor-agent CLI argv vectors.
-// No side effects, no child_process — safe to import from tests.
-// Imported by server.js; the MCP server layer composes these into spawn calls.
+// Pure helpers for the cursor-agent MCP wrapper.
+// No I/O, no child_process — safe to import from tests.
+// Imported by server.js (argv assembly, timeout resolution, result projection,
+// model-list parsing, session-registry path resolution and upsert logic).
+// I/O for the session registry lives in session-registry.js.
+
+import path from 'node:path';
+import os from 'node:os';
 
 // Build leading CLI flags for execution mode and session continuity.
 // `resume` (specific id) takes precedence over `continue_session` (most recent).
@@ -127,6 +132,60 @@ export function buildStructuredResult({
     content: [{ type: 'text', text }],
     structuredContent,
   };
+}
+
+// Resolve the on-disk path for the persistent session registry.
+// Precedence: CURSOR_AGENT_MCP_STATE_DIR env (explicit) >
+//             $XDG_STATE_HOME/cursor-agent-mcp >
+//             $HOME/.local/state/cursor-agent-mcp.
+// File name is always `sessions.json`. Refs #1.
+export function resolveSessionRegistryPath({ env = process.env, home = os.homedir() } = {}) {
+  if (env.CURSOR_AGENT_MCP_STATE_DIR && String(env.CURSOR_AGENT_MCP_STATE_DIR).trim()) {
+    return path.join(String(env.CURSOR_AGENT_MCP_STATE_DIR).trim(), 'sessions.json');
+  }
+  const xdgState =
+    (env.XDG_STATE_HOME && String(env.XDG_STATE_HOME).trim()) ||
+    path.join(home, '.local', 'state');
+  return path.join(xdgState, 'cursor-agent-mcp', 'sessions.json');
+}
+
+// Pure upsert: given an existing registry blob and a new entry, return the
+// updated registry. Does NOT touch disk — callers read/write at the boundary.
+// On first sight of a session_id: appends with first_seen_at=last_seen_at=now
+// and any optional model/prompt_preview supplied.
+// On repeat: updates last_seen_at, allows model to be promoted from absent or
+// to a new value, but PRESERVES prompt_preview (we want the original prompt
+// for context, not a later resume's prompt).
+// Non-array `sessions` and unrelated top-level keys are tolerated.
+// Refs #1.
+export function upsertSessionEntry(existingRegistry, entry) {
+  if (!entry || typeof entry !== 'object' || !entry.session_id) {
+    throw new TypeError('upsertSessionEntry: entry.session_id is required');
+  }
+  const baseSessions = Array.isArray(existingRegistry?.sessions)
+    ? existingRegistry.sessions
+    : [];
+  const sessions = [...baseSessions];
+  const ts = typeof entry.timestamp_ms === 'number' ? entry.timestamp_ms : Date.now();
+  const iso = new Date(ts).toISOString();
+  const idx = sessions.findIndex((s) => s && s.session_id === entry.session_id);
+  if (idx >= 0) {
+    const prev = sessions[idx];
+    sessions[idx] = {
+      ...prev,
+      last_seen_at: iso,
+      ...(entry.model ? { model: entry.model } : {}),
+    };
+  } else {
+    sessions.push({
+      session_id: entry.session_id,
+      first_seen_at: iso,
+      last_seen_at: iso,
+      ...(entry.model ? { model: entry.model } : {}),
+      ...(entry.prompt_preview ? { prompt_preview: entry.prompt_preview } : {}),
+    });
+  }
+  return { ...existingRegistry, sessions };
 }
 
 // Parse cursor-agent's `--list-models` text output into a structured list.

@@ -11,6 +11,8 @@ import {
   resolveTimeoutMs,
   buildStructuredResult,
   parseModelList,
+  resolveSessionRegistryPath,
+  upsertSessionEntry,
 } from '../argv-builder.js';
 
 describe('buildSessionFlags', () => {
@@ -424,5 +426,126 @@ describe('parseModelList (Refs #4)', () => {
       out.models.map((m) => m.id),
       ['z-model', 'a-model', 'm-model'],
     );
+  });
+});
+
+describe('resolveSessionRegistryPath (Refs #1)', () => {
+  it('honors CURSOR_AGENT_MCP_STATE_DIR when set', () => {
+    const p = resolveSessionRegistryPath({
+      env: { CURSOR_AGENT_MCP_STATE_DIR: '/tmp/custom' },
+      home: '/home/x',
+    });
+    assert.equal(p, '/tmp/custom/sessions.json');
+  });
+
+  it('falls back to XDG_STATE_HOME/cursor-agent-mcp/sessions.json', () => {
+    const p = resolveSessionRegistryPath({
+      env: { XDG_STATE_HOME: '/xdg/state' },
+      home: '/home/x',
+    });
+    assert.equal(p, '/xdg/state/cursor-agent-mcp/sessions.json');
+  });
+
+  it('falls back to $HOME/.local/state/... when no env hints', () => {
+    const p = resolveSessionRegistryPath({ env: {}, home: '/home/x' });
+    assert.equal(p, '/home/x/.local/state/cursor-agent-mcp/sessions.json');
+  });
+
+  it('CURSOR_AGENT_MCP_STATE_DIR beats XDG_STATE_HOME', () => {
+    const p = resolveSessionRegistryPath({
+      env: { CURSOR_AGENT_MCP_STATE_DIR: '/explicit', XDG_STATE_HOME: '/xdg' },
+      home: '/home/x',
+    });
+    assert.equal(p, '/explicit/sessions.json');
+  });
+});
+
+describe('upsertSessionEntry (Refs #1)', () => {
+  const t0 = Date.UTC(2026, 4, 28, 12, 0, 0); // 2026-05-28T12:00:00Z
+
+  it('initializes an empty registry on first call', () => {
+    const out = upsertSessionEntry(
+      {},
+      { session_id: 'abc-1', model: 'auto', timestamp_ms: t0 },
+    );
+    assert.equal(out.sessions.length, 1);
+    assert.equal(out.sessions[0].session_id, 'abc-1');
+    assert.equal(out.sessions[0].first_seen_at, '2026-05-28T12:00:00.000Z');
+    assert.equal(out.sessions[0].last_seen_at, '2026-05-28T12:00:00.000Z');
+    assert.equal(out.sessions[0].model, 'auto');
+  });
+
+  it('appends a new entry rather than overwriting existing', () => {
+    const reg = { sessions: [{ session_id: 'first', first_seen_at: 'x', last_seen_at: 'x' }] };
+    const out = upsertSessionEntry(reg, {
+      session_id: 'second',
+      timestamp_ms: t0,
+    });
+    assert.equal(out.sessions.length, 2);
+    assert.equal(out.sessions[0].session_id, 'first');
+    assert.equal(out.sessions[1].session_id, 'second');
+  });
+
+  it('updates last_seen_at on repeat session_id, preserves first_seen_at', () => {
+    const reg = {
+      sessions: [{
+        session_id: 'abc',
+        first_seen_at: '2026-05-27T00:00:00.000Z',
+        last_seen_at: '2026-05-27T00:00:00.000Z',
+        model: 'auto',
+      }],
+    };
+    const out = upsertSessionEntry(reg, {
+      session_id: 'abc',
+      timestamp_ms: t0,
+    });
+    assert.equal(out.sessions.length, 1);
+    assert.equal(out.sessions[0].first_seen_at, '2026-05-27T00:00:00.000Z');
+    assert.equal(out.sessions[0].last_seen_at, '2026-05-28T12:00:00.000Z');
+    assert.equal(out.sessions[0].model, 'auto', 'model preserved');
+  });
+
+  it('updates model on repeat if new entry carries one', () => {
+    const reg = {
+      sessions: [{ session_id: 'abc', first_seen_at: 'x', last_seen_at: 'x', model: 'auto' }],
+    };
+    const out = upsertSessionEntry(reg, {
+      session_id: 'abc',
+      model: 'gpt-5.3-codex',
+      timestamp_ms: t0,
+    });
+    assert.equal(out.sessions[0].model, 'gpt-5.3-codex');
+  });
+
+  it('preserves prompt_preview on first insert, does not overwrite on update', () => {
+    let reg = upsertSessionEntry({}, {
+      session_id: 's1',
+      prompt_preview: 'Hello there',
+      timestamp_ms: t0,
+    });
+    reg = upsertSessionEntry(reg, {
+      session_id: 's1',
+      prompt_preview: 'Should NOT replace',
+      timestamp_ms: t0 + 1000,
+    });
+    assert.equal(reg.sessions[0].prompt_preview, 'Hello there');
+  });
+
+  it('tolerates non-array sessions (legacy / corrupted shape) by treating as empty', () => {
+    const out = upsertSessionEntry(
+      { sessions: 'oops' },
+      { session_id: 'new', timestamp_ms: t0 },
+    );
+    assert.equal(out.sessions.length, 1);
+    assert.equal(out.sessions[0].session_id, 'new');
+  });
+
+  it('preserves unrelated registry keys (forward-compat)', () => {
+    const out = upsertSessionEntry(
+      { sessions: [], version: 1, meta: { foo: 'bar' } },
+      { session_id: 'x', timestamp_ms: t0 },
+    );
+    assert.equal(out.version, 1);
+    assert.deepEqual(out.meta, { foo: 'bar' });
   });
 });

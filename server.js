@@ -14,7 +14,9 @@ import {
   resolveTimeoutMs,
   buildStructuredResult,
   parseModelList,
+  resolveSessionRegistryPath,
 } from './argv-builder.js';
+import { recordSession, loadRegistry } from './session-registry.js';
 
 // Tool input schema
 const RUN_SCHEMA = z.object({
@@ -132,12 +134,30 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
      if (code === 0 || (killedByIdle && out)) {
        // Success path: surface session_id, duration, etc. via structuredContent
        // (only parses stdout as JSON when output_format === 'json'). Refs #3.
-       resolve(buildStructuredResult({
+       const built = buildStructuredResult({
          stdout: out,
          output_format,
          started_at_ms: startedAtMs,
          ended_at_ms: Date.now(),
-       }));
+       });
+       // Best-effort session capture: when stdout was JSON and yielded a
+       // session_id, persist it into the registry for later headless discovery.
+       // Fires and forgets — registry failures must NOT affect the tool result. Refs #1.
+       const sid = built.structuredContent?.session_id;
+       if (sid) {
+         const lastArg = Array.isArray(finalArgv) && finalArgv.length
+           ? String(finalArgv[finalArgv.length - 1])
+           : '';
+         const promptPreview = lastArg && !lastArg.startsWith('-')
+           ? lastArg.slice(0, 80)
+           : undefined;
+         recordSession({
+           session_id: sid,
+           model: built.structuredContent?.model,
+           prompt_preview: promptPreview,
+         }).catch(() => {});
+       }
+       resolve(built);
      } else {
        resolve({
          content: [{ type: 'text', text: `cursor-agent exited with code ${code}\n${err || out || '(no output)'}` }],
@@ -219,6 +239,7 @@ const server = new McpServer(
        '- cursor_agent_search_repo: prompt-based code search with include/exclude globs.',
        '- cursor_agent_plan_task: read-only planning (enforces --mode plan by default) given a goal and optional constraints.',
        '- cursor_agent_list_models: list models advertised by the installed cursor-agent (`--list-models`); returns structuredContent.models = [{id, name}].',
+       '- cursor_agent_list_sessions: list session_ids captured by this server (auto-recorded on output_format:"json" calls); structuredContent.sessions = [{session_id, first_seen_at, last_seen_at, model?, prompt_preview?}].',
        '- cursor_agent_raw: pass raw argv directly to cursor-agent; set print=false to avoid implicit --print. (Put --mode/--resume in argv yourself; typed mode/resume/continue_session are ignored here.)',
        '- cursor_agent_run: legacy single-shot chat (prompt as positional).',
        'Shared params: force (write gate, Claude-decided), mode (plan|ask — read-only; Debug/other TUI modes are NOT headless-available), resume (continue a specific chat id from a prior JSON result), continue_session (continue most recent), timeout_ms (per-call server hard timeout; default 300s).',
@@ -301,6 +322,9 @@ const LIST_MODELS_SCHEMA = z.object({
   executable: z.string().optional(),
   timeout_ms: z.number().int().positive().optional().describe('Per-call server hard timeout in ms. Default: 300000.'),
 });
+
+// list_sessions takes no params — it reads the persistent registry on disk.
+const LIST_SESSIONS_SCHEMA = z.object({});
 
 // Tools
 server.tool(
@@ -406,6 +430,35 @@ server.tool(
       return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
+    }
+  },
+);
+
+// List cursor-agent sessions captured by this server across calls. The registry
+// is a local JSON file (default: $XDG_STATE_HOME/cursor-agent-mcp/sessions.json).
+// `cursor-agent ls` is TTY-only and cannot be used headlessly; this tool plus
+// the JSON-output capture in invokeCursorAgent provides a headless alternative. Refs #1.
+server.tool(
+  'cursor_agent_list_sessions',
+  'List cursor-agent sessions captured by this server. Entries are recorded automatically on any successful call where output_format:"json" returned a session_id. Each entry: { session_id, first_seen_at, last_seen_at, model?, prompt_preview? }. Use the registry to pick a session_id for `resume`. Storage path: CURSOR_AGENT_MCP_STATE_DIR > XDG_STATE_HOME > ~/.local/state. Disable capture with CURSOR_AGENT_MCP_DISABLE_REGISTRY=1.',
+  LIST_SESSIONS_SCHEMA.shape,
+  async () => {
+    try {
+      const registryPath = resolveSessionRegistryPath();
+      const reg = await loadRegistry();
+      const sessions = Array.isArray(reg?.sessions) ? reg.sessions : [];
+      const text = sessions.length === 0
+        ? `No sessions recorded yet.\nRegistry path: ${registryPath}\nSessions are captured automatically when a call sets output_format:"json" and cursor-agent returns a session_id.`
+        : sessions.map((s) =>
+            `${s.session_id}  ${s.model || '(no model)'}  first=${s.first_seen_at}  last=${s.last_seen_at}` +
+            (s.prompt_preview ? `\n  "${s.prompt_preview}"` : ''),
+          ).join('\n');
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: { sessions, count: sessions.length, registry_path: registryPath },
+      };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Failed to read session registry: ${e?.message || e}` }], isError: true };
     }
   },
 );

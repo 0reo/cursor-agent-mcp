@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An **MCP server (`server.js`) that wraps the `cursor-agent` CLI** over stdio, exposing it as Claude-friendly tools (chat / edit / analyze / search / plan / raw). It lets an MCP host (Claude Code) drive cursor-agent's headless print mode. Pure argv/flag builders live in `argv-builder.js` (imported by `server.js`) so they can be unit-tested without spawning the binary. `private: true`, runs from the repo (not published to npm).
+An **MCP server (`server.js`) that wraps the `cursor-agent` CLI** over stdio, exposing it as Claude-friendly tools (chat / edit / analyze / search / plan / raw + list_models + list_sessions). It lets an MCP host (Claude Code) drive cursor-agent's headless print mode. Pure argv/flag/result helpers live in `argv-builder.js` and session-registry I/O lives in `session-registry.js` (both imported by `server.js`) so logic can be unit-tested without spawning the binary. `private: true`, runs from the repo (not published to npm).
 
 This is a fork: `origin` = `0reo/cursor-agent-mcp` (ours), `upstream` = `sailay1996/cursor-agent-mcp`. Enhancement work is tracked in **issues on the fork** (`gh issue list -R 0reo/cursor-agent-mcp`).
 
@@ -18,7 +18,7 @@ node verify_modes.mjs        # E2E: mode:plan + resume round-trip (spawns a FRES
 npm test                     # runs test_client.mjs — also a LIVE E2E that bills; not a unit test
 ```
 
-Unit tests for pure builders (`buildSessionFlags`, `buildFinalArgv`) live in `tests/argv-builder.test.mjs` and run via `node --test`. Every change to flag-emission logic should be testable here first; reach for `verify_modes.mjs` only when behavior depends on the actual cursor-agent runtime.
+Unit tests live under `tests/` and run via `node --test`. `argv-builder.test.mjs` covers all pure helpers in `argv-builder.js` (argv assembly, timeout resolution, structured-result projection, model-list parsing, session upsert). `session-registry.test.mjs` covers the I/O wrappers using `os.tmpdir()` — fast, isolated, no spawn. Every change to flag-emission, result projection, or registry behavior should be testable here first; reach for `verify_modes.mjs` only when behavior depends on the actual cursor-agent runtime.
 
 Running the server standalone (normally a host spawns it):
 ```bash
@@ -30,8 +30,9 @@ DEBUG_CURSOR_MCP=1 ...        # logs the exact spawned argv + session/extra flag
 
 Two layers inside `server.js`, plus a pure-function sibling:
 
-- **`argv-builder.js`** (pure, no I/O, no spawn) — exports `buildSessionFlags`, `buildFinalArgv`, `resolveTimeoutMs`, `buildStructuredResult`, and the `DEFAULT_TIMEOUT_MS` constant. Encapsulates every flag-emission rule (model precedence, force precedence, user-argv deduplication, print-format ordering), timeout resolution (per-call > env > 5min default), and the JSON-result projection that surfaces `session_id` / `model` / `usage` / `duration_ms` into MCP `structuredContent`. Test target for `tests/argv-builder.test.mjs`.
-- **`invokeCursorAgent({argv, output_format, model, force, print, timeout_ms, ...})`** — the only place that spawns the binary (`spawn`, `shell:false`). Calls `buildFinalArgv` to assemble the argv, `resolveTimeoutMs` for the hard kill, and `buildStructuredResult` to project the success-path stdout into a `{content, structuredContent}` shape. Manages the idle kill (`CURSOR_AGENT_IDLE_EXIT_MS`) and preserves any buffered partial stdout on timeout. Resolves the executable via `resolveExecutable()` (explicit arg → `CURSOR_AGENT_PATH` → PATH).
+- **`argv-builder.js`** (pure, no I/O, no spawn) — exports `buildSessionFlags`, `buildFinalArgv`, `resolveTimeoutMs`, `buildStructuredResult`, `parseModelList`, `resolveSessionRegistryPath`, `upsertSessionEntry`, plus the `DEFAULT_TIMEOUT_MS` constant. Encapsulates every flag-emission rule, timeout resolution, JSON-result projection, model-list parsing, and the session-registry upsert algebra. Test target for `tests/argv-builder.test.mjs`.
+- **`session-registry.js`** (impure, async fs) — exports `readRegistry`, `writeRegistry`, `recordSession`, `loadRegistry`, `isRegistryDisabled`. Wraps the pure upsert with atomic-rename writes and ENOENT/corruption tolerance. Honors `CURSOR_AGENT_MCP_DISABLE_REGISTRY=1` to skip writes entirely. Test target for `tests/session-registry.test.mjs` (uses tmpdir).
+- **`invokeCursorAgent({argv, output_format, model, force, print, timeout_ms, ...})`** — the only place that spawns the binary (`spawn`, `shell:false`). Calls `buildFinalArgv` to assemble argv, `resolveTimeoutMs` for the hard kill, and `buildStructuredResult` to project the success-path stdout into `{content, structuredContent}`. On success, when `structuredContent.session_id` is present, fires `recordSession(...)` best-effort into the registry. Manages the idle kill (`CURSOR_AGENT_IDLE_EXIT_MS`) and preserves any buffered partial stdout on timeout. Resolves the executable via `resolveExecutable()` (explicit arg → `CURSOR_AGENT_PATH` → PATH).
 - **`runCursorAgent(input)`** — assembles the prompt path: `argv = [...buildSessionFlags(...), ...extra_args, prompt]`, then calls `invokeCursorAgent`. Handles prompt echo. **All prompt-based tools funnel through here.**
 
 Tool registration (via `server.tool` + zod schemas):
@@ -53,7 +54,7 @@ Tool registration (via `server.tool` + zod schemas):
 
 ## Environment variables
 
-`CURSOR_AGENT_PATH` (binary path), `CURSOR_AGENT_MODEL` (default model — use `auto`/`gpt-5.2`/`gpt-5.3-codex`; the README's `gpt-5` is stale), `CURSOR_AGENT_FORCE` (write default; leave unset = propose-only), `CURSOR_AGENT_TIMEOUT_MS` (server hard timeout), `CURSOR_AGENT_IDLE_EXIT_MS` (`0` recommended — prevents premature termination mid-generation), `CURSOR_AGENT_ECHO_PROMPT`, `DEBUG_CURSOR_MCP=1`.
+`CURSOR_AGENT_PATH` (binary path), `CURSOR_AGENT_MODEL` (default model — use `auto`/`gpt-5.2`/`gpt-5.3-codex`; the README's `gpt-5` is stale — run `cursor_agent_list_models` for the authoritative current list), `CURSOR_AGENT_FORCE` (write default; leave unset = propose-only), `CURSOR_AGENT_TIMEOUT_MS` (server hard timeout), `CURSOR_AGENT_IDLE_EXIT_MS` (`0` recommended — prevents premature termination mid-generation), `CURSOR_AGENT_MCP_STATE_DIR` (override the session-registry directory — defaults to `$XDG_STATE_HOME/cursor-agent-mcp` then `~/.local/state/cursor-agent-mcp`), `CURSOR_AGENT_MCP_DISABLE_REGISTRY` (`1` skips registry writes entirely), `CURSOR_AGENT_ECHO_PROMPT`, `DEBUG_CURSOR_MCP=1`.
 
 ### Three layered timeouts
 
