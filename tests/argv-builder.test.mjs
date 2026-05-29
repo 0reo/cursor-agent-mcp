@@ -5,7 +5,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildSessionFlags, buildFinalArgv, resolveTimeoutMs } from '../argv-builder.js';
+import {
+  buildSessionFlags,
+  buildFinalArgv,
+  resolveTimeoutMs,
+  buildStructuredResult,
+} from '../argv-builder.js';
 
 describe('buildSessionFlags', () => {
   it('returns [] for empty input', () => {
@@ -246,5 +251,114 @@ describe('resolveTimeoutMs (Refs #9)', () => {
       resolveTimeoutMs({ env: emptyEnv, defaultMs: 90000 }),
       90000,
     );
+  });
+});
+
+describe('buildStructuredResult (Refs #3)', () => {
+  it('always includes duration_ms in structuredContent when timing is provided', () => {
+    const r = buildStructuredResult({
+      stdout: 'hi',
+      output_format: 'text',
+      started_at_ms: 1000,
+      ended_at_ms: 1500,
+    });
+    assert.equal(r.structuredContent.duration_ms, 500);
+  });
+
+  it('sets duration_ms to null when timing is missing', () => {
+    const r = buildStructuredResult({ stdout: 'hi', output_format: 'text' });
+    assert.equal(r.structuredContent.duration_ms, null);
+  });
+
+  it('clamps negative duration to 0 (clock skew guard)', () => {
+    const r = buildStructuredResult({
+      stdout: 'hi',
+      output_format: 'text',
+      started_at_ms: 2000,
+      ended_at_ms: 1000,
+    });
+    assert.equal(r.structuredContent.duration_ms, 0);
+  });
+
+  it('text output_format: content is the raw stdout, structuredContent has only duration', () => {
+    const r = buildStructuredResult({
+      stdout: 'hello world',
+      output_format: 'text',
+      started_at_ms: 1000,
+      ended_at_ms: 1100,
+    });
+    assert.deepEqual(r.content, [{ type: 'text', text: 'hello world' }]);
+    assert.equal(r.structuredContent.session_id, undefined);
+    assert.equal(r.structuredContent.parsed, undefined);
+  });
+
+  it('substitutes "(no output)" when stdout is empty', () => {
+    const r = buildStructuredResult({ stdout: '', output_format: 'text' });
+    assert.deepEqual(r.content, [{ type: 'text', text: '(no output)' }]);
+  });
+
+  it('json output_format with valid JSON: surfaces session_id, model, usage; flags parsed:true', () => {
+    const payload = {
+      session_id: 'abc-123',
+      model: 'gpt-5.3-codex',
+      result: 'agent reply',
+      usage: { input_tokens: 100, output_tokens: 42 },
+    };
+    const r = buildStructuredResult({
+      stdout: JSON.stringify(payload),
+      output_format: 'json',
+      started_at_ms: 1000,
+      ended_at_ms: 1750,
+    });
+    assert.equal(r.structuredContent.session_id, 'abc-123');
+    assert.equal(r.structuredContent.model, 'gpt-5.3-codex');
+    assert.deepEqual(r.structuredContent.usage, { input_tokens: 100, output_tokens: 42 });
+    assert.equal(r.structuredContent.parsed, true);
+    assert.deepEqual(r.structuredContent.raw, payload);
+    assert.equal(r.structuredContent.duration_ms, 750);
+    // back-compat: content still has the raw stdout
+    assert.equal(r.content[0].text, JSON.stringify(payload));
+  });
+
+  it('json output_format with INVALID JSON: parsed:false, parse_error present, content preserves stdout', () => {
+    const r = buildStructuredResult({
+      stdout: 'not json {{{',
+      output_format: 'json',
+      started_at_ms: 0,
+      ended_at_ms: 50,
+    });
+    assert.equal(r.structuredContent.parsed, false);
+    assert.ok(typeof r.structuredContent.parse_error === 'string' && r.structuredContent.parse_error.length > 0);
+    assert.equal(r.structuredContent.session_id, undefined);
+    assert.equal(r.content[0].text, 'not json {{{');
+  });
+
+  it('json output_format with parsed primitive (not object): does not crash, no extracted fields', () => {
+    const r = buildStructuredResult({
+      stdout: '42',
+      output_format: 'json',
+    });
+    assert.equal(r.structuredContent.parsed, true);
+    assert.equal(r.structuredContent.session_id, undefined);
+    assert.equal(r.structuredContent.raw, 42);
+  });
+
+  it('text output_format does NOT attempt JSON parsing even if stdout looks like JSON', () => {
+    const r = buildStructuredResult({
+      stdout: '{"session_id":"x"}',
+      output_format: 'text',
+    });
+    assert.equal(r.structuredContent.session_id, undefined);
+    assert.equal(r.structuredContent.parsed, undefined);
+  });
+
+  it('json: missing top-level fields are simply omitted (no defaults injected)', () => {
+    const r = buildStructuredResult({
+      stdout: JSON.stringify({ session_id: 'only-id' }),
+      output_format: 'json',
+    });
+    assert.equal(r.structuredContent.session_id, 'only-id');
+    assert.equal(r.structuredContent.model, undefined);
+    assert.equal(r.structuredContent.usage, undefined);
   });
 });

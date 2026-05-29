@@ -8,7 +8,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn } from 'node:child_process';
 import process from 'node:process';
 
-import { buildSessionFlags, buildFinalArgv, resolveTimeoutMs } from './argv-builder.js';
+import {
+  buildSessionFlags,
+  buildFinalArgv,
+  resolveTimeoutMs,
+  buildStructuredResult,
+} from './argv-builder.js';
 
 // Tool input schema
 const RUN_SCHEMA = z.object({
@@ -42,6 +47,7 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
  const cmd = resolveExecutable(executable);
  const finalArgv = buildFinalArgv({ argv, output_format, model, force, print });
  const timeoutMs = resolveTimeoutMs({ timeout_ms });
+ const startedAtMs = Date.now();
 
  return new Promise((resolve) => {
    let settled = false;
@@ -123,7 +129,14 @@ async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable
        try { console.error('[cursor-mcp] exit:', code, 'stdout bytes=', out.length, 'stderr bytes=', err.length); } catch {}
      }
      if (code === 0 || (killedByIdle && out)) {
-       resolve({ content: [{ type: 'text', text: out || '(no output)' }] });
+       // Success path: surface session_id, duration, etc. via structuredContent
+       // (only parses stdout as JSON when output_format === 'json'). Refs #3.
+       resolve(buildStructuredResult({
+         stdout: out,
+         output_format,
+         started_at_ms: startedAtMs,
+         ended_at_ms: Date.now(),
+       }));
      } else {
        resolve({
          content: [{ type: 'text', text: `cursor-agent exited with code ${code}\n${err || out || '(no output)'}` }],
@@ -206,7 +219,8 @@ const server = new McpServer(
        '- cursor_agent_plan_task: read-only planning (enforces --mode plan by default) given a goal and optional constraints.',
        '- cursor_agent_raw: pass raw argv directly to cursor-agent; set print=false to avoid implicit --print. (Put --mode/--resume in argv yourself; typed mode/resume/continue_session are ignored here.)',
        '- cursor_agent_run: legacy single-shot chat (prompt as positional).',
-       'Shared params: force (write gate, Claude-decided), mode (plan|ask — read-only; Debug/other TUI modes are NOT headless-available), resume (continue a specific chat id from a prior JSON result), continue_session (continue most recent).',
+       'Shared params: force (write gate, Claude-decided), mode (plan|ask — read-only; Debug/other TUI modes are NOT headless-available), resume (continue a specific chat id from a prior JSON result), continue_session (continue most recent), timeout_ms (per-call server hard timeout; default 300s).',
+       'Successful results carry MCP structuredContent with at least { duration_ms }; with output_format:"json" they also surface { session_id, model, usage, result, raw } when present in cursor-agent\'s JSON.',
      ].join(' '),
  },
 );

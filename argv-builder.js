@@ -78,3 +78,53 @@ export function resolveTimeoutMs({
   }
   return defaultMs;
 }
+
+// Top-level JSON fields we lift into structuredContent so MCP hosts can read
+// them as first-class data without re-parsing. session_id is the only one we
+// rely on (used by `resume`); model/usage/result are surfaced opportunistically.
+const SURFACED_JSON_KEYS = ['session_id', 'model', 'usage', 'result'];
+
+// Build a structured MCP tool result for a cursor-agent stdout.
+// Always returns { content, structuredContent } ready to spread into a tool reply.
+// - content: [{type: 'text', text}] preserves the raw stdout for back-compat
+//   (callers reading content[0].text continue to work).
+// - structuredContent always carries duration_ms (null if timing not supplied).
+//   When output_format === 'json' and stdout is parseable, surfaces session_id,
+//   model, usage, result (when present), and the full parsed payload under `raw`.
+//   On parse failure: parsed=false plus parse_error string; content unchanged.
+// Refs #3.
+export function buildStructuredResult({
+  stdout = '',
+  output_format = 'text',
+  started_at_ms,
+  ended_at_ms,
+} = {}) {
+  const duration_ms =
+    typeof started_at_ms === 'number' && typeof ended_at_ms === 'number'
+      ? Math.max(0, ended_at_ms - started_at_ms)
+      : null;
+
+  const structuredContent = { duration_ms };
+  const text = stdout && stdout.length > 0 ? stdout : '(no output)';
+
+  if (output_format === 'json' && stdout) {
+    try {
+      const parsed = JSON.parse(stdout);
+      structuredContent.parsed = true;
+      structuredContent.raw = parsed;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const key of SURFACED_JSON_KEYS) {
+          if (parsed[key] !== undefined) structuredContent[key] = parsed[key];
+        }
+      }
+    } catch (e) {
+      structuredContent.parsed = false;
+      structuredContent.parse_error = String(e?.message || e);
+    }
+  }
+
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent,
+  };
+}
