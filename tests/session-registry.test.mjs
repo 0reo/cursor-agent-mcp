@@ -141,6 +141,28 @@ describe('session-registry I/O (Refs #1)', () => {
     assert.equal(r.sessions[0].prompt_preview.length, 80);
   });
 
+  it('concurrent recordSession calls all land — no lost updates from temp-file collision', async () => {
+    // Regression for the code-reviewer's race finding: writeRegistry used
+    // ${filePath}.tmp.${process.pid} as the temp path, so two concurrent
+    // writers in the same process collided on a single temp file and could
+    // either (a) lose updates via read-before-other-writes, or (b) corrupt
+    // the destination via interleaved truncates + races on rename(). With
+    // sequential awaits the test suite never hit this — fan out via
+    // Promise.all to expose it.
+    const dir = await tmpDir();
+    const env = { CURSOR_AGENT_MCP_STATE_DIR: dir };
+    const ids = Array.from({ length: 20 }, (_, i) => `concurrent-${i}`);
+    await Promise.all(
+      ids.map((session_id) => recordSession({ session_id, timestamp_ms: 1000 + Number(session_id.split('-')[1]) }, { env })),
+    );
+    const r = await loadRegistry({ env });
+    const seen = new Set(r.sessions.map((s) => s.session_id));
+    for (const id of ids) {
+      assert.ok(seen.has(id), `lost session ${id} (race fix incomplete)`);
+    }
+    assert.equal(r.sessions.length, ids.length, 'registry size must match input set exactly');
+  });
+
   it('maybeRecordSession no-ops when structuredContent has no session_id', async () => {
     const dir = await tmpDir();
     const env = { CURSOR_AGENT_MCP_STATE_DIR: dir };

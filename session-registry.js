@@ -6,6 +6,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { resolveSessionRegistryPath, upsertSessionEntry } from './argv-builder.js';
 
 const EMPTY = () => ({ sessions: [] });
@@ -35,27 +36,46 @@ export async function readRegistry(filePath) {
 }
 
 // Atomic-ish write: write to a sibling temp file then rename into place.
-// Creates parent directories as needed.
+// Creates parent directories as needed. The temp suffix includes a
+// crypto-random tag so concurrent writers in the same process never collide
+// on the same temp path (a regression mode that could leave a partially-
+// written file in place after an interleaved truncate+rename race).
 export async function writeRegistry(filePath, data) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp.${process.pid}`;
+  const tmp = `${filePath}.tmp.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
   await fs.writeFile(tmp, JSON.stringify(data, null, 2));
   await fs.rename(tmp, filePath);
 }
 
+// Per-filePath write-serialization queue. Two concurrent recordSession
+// callers would otherwise hit a read-upsert-write race where writer A
+// observes [X], writer B observes [X], both upsert their entry against the
+// same base, and whichever rename wins overwrites the other's entry. The
+// queue chains read+upsert+write so each entry sees the previous writer's
+// committed view. One entry per filePath; size stays O(1) at steady state.
+const writeQueues = new Map();
+
 // Best-effort: read, upsert, write. Never throws. Skipped entirely when
-// CURSOR_AGENT_MCP_DISABLE_REGISTRY is truthy.
+// CURSOR_AGENT_MCP_DISABLE_REGISTRY is truthy. Concurrent callers are
+// serialized per-filePath via writeQueues so two writers cannot overwrite
+// each other's entries.
 export async function recordSession(entry, { env = process.env, home } = {}) {
   if (isRegistryDisabled(env)) return;
   if (!entry || !entry.session_id) return;
   const filePath = resolveSessionRegistryPath({ env, home });
-  try {
-    const reg = await readRegistry(filePath);
-    const next = upsertSessionEntry(reg, entry);
-    await writeRegistry(filePath, next);
-  } catch {
-    // best-effort — registry is a discovery convenience, not load-bearing
-  }
+
+  const prev = writeQueues.get(filePath) ?? Promise.resolve();
+  const next = prev.then(async () => {
+    try {
+      const reg = await readRegistry(filePath);
+      const updated = upsertSessionEntry(reg, entry);
+      await writeRegistry(filePath, updated);
+    } catch {
+      // best-effort — registry is a discovery convenience, not load-bearing
+    }
+  });
+  writeQueues.set(filePath, next);
+  await next;
 }
 
 // Return the full registry blob from disk (or an empty one if absent).

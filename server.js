@@ -425,7 +425,7 @@ server.tool(
   async (args, extra) => {
     try {
       const onProgress = makeProgressDispatcher(extra);
-      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
+      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt } = args;
       const composedPrompt =
         `Edit the repository file:\n` +
         `- File: ${String(file)}\n` +
@@ -433,7 +433,7 @@ server.tool(
         (apply ? `- Apply changes if safe.\n` : `- Propose a patch/diff without applying.\n`) +
         (dry_run ? `- Treat as dry-run; do not write to disk.\n` : ``) +
         (prompt ? `- Additional context: ${String(prompt)}\n` : ``);
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -447,13 +447,13 @@ server.tool(
   async (args, extra) => {
     try {
       const onProgress = makeProgressDispatcher(extra);
-      const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
+      const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt } = args;
       const list = Array.isArray(paths) ? paths : [paths];
       const composedPrompt =
         `Analyze the following paths in the repository:\n` +
         list.map((p) => `- ${String(p)}`).join('\n') + '\n' +
         (prompt ? `Additional prompt: ${String(prompt)}\n` : '');
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -467,7 +467,7 @@ server.tool(
   async (args, extra) => {
     try {
       const onProgress = makeProgressDispatcher(extra);
-      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
+      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt } = args;
       const inc = include == null ? [] : (Array.isArray(include) ? include : [include]);
       const exc = exclude == null ? [] : (Array.isArray(exclude) ? exclude : [exclude]);
       const composedPrompt =
@@ -476,7 +476,7 @@ server.tool(
         (inc.length ? `- Include globs:\n${inc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         (exc.length ? `- Exclude globs:\n${exc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         `Return concise findings with file paths and line references.`;
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -490,7 +490,7 @@ server.tool(
   async (args, extra) => {
     try {
       const onProgress = makeProgressDispatcher(extra);
-      const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
+      const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt } = args;
       const cons = constraints ?? [];
       const composedPrompt =
         `Create a step-by-step plan to accomplish the following goal:\n` +
@@ -499,7 +499,7 @@ server.tool(
         `Provide a numbered list of actions.`;
       // Enforce real read-only Plan mode by default (caller may override mode explicitly).
       // This makes plan_task actually no-edit at the CLI level, not just a prompt asking for a plan.
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt, onProgress });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -637,9 +637,9 @@ server.tool(
  async (args, extra) => {
    try {
      const onProgress = makeProgressDispatcher(extra);
-     const { argv, output_format, cwd, executable, model, force, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
+     const { argv, output_format, cwd, executable, model, force, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt } = args;
      // For raw calls we disable implicit --print to allow commands like "--help"
-     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, onProgress });
+     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust, echo_prompt, onProgress });
    } catch (e) {
      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
    }
