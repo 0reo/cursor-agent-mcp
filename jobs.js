@@ -141,7 +141,7 @@ export function createJob(opts = {}, { spawnFn = defaultSpawn, resolveExecutable
       });
       maybeRecordSession({
         structuredContent: built.structuredContent,
-        finalArgv,
+        userArgv: argv,
       }).catch(() => {});
     } else {
       job.status = 'failed';

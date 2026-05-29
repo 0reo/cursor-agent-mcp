@@ -13,6 +13,7 @@ import {
   recordSession,
   loadRegistry,
   isRegistryDisabled,
+  maybeRecordSession,
 } from '../session-registry.js';
 
 async function tmpDir() {
@@ -104,6 +105,49 @@ describe('session-registry I/O (Refs #1)', () => {
     const dir = await tmpDir();
     const env = { CURSOR_AGENT_MCP_STATE_DIR: dir };
     await recordSession({ model: 'auto' }, { env }); // no session_id
+    let exists = true;
+    try { await fs.stat(path.join(dir, 'sessions.json')); }
+    catch (e) { if (e?.code === 'ENOENT') exists = false; else throw e; }
+    assert.equal(exists, false);
+  });
+
+  it('maybeRecordSession derives prompt_preview from the LAST userArgv element (regression: must be USER argv, not finalArgv)', async () => {
+    const dir = await tmpDir();
+    const env = { CURSOR_AGENT_MCP_STATE_DIR: dir };
+    // userArgv is what runCursorAgent assembles via buildPromptArgv — the
+    // prompt is the last element. The buggy code used finalArgv which
+    // includes trailing `--model auto`, so "auto" leaked in as prompt_preview.
+    await maybeRecordSession(
+      {
+        structuredContent: { session_id: 'sess-x', model: 'auto' },
+        userArgv: ['--mode', 'ask', 'Remember PURPLE-OTTER'],
+      },
+      { env },
+    );
+    const r = await loadRegistry({ env });
+    assert.equal(r.sessions[0].prompt_preview, 'Remember PURPLE-OTTER');
+    assert.notEqual(r.sessions[0].prompt_preview, 'auto', 'prompt_preview must NOT be the model name');
+  });
+
+  it('maybeRecordSession truncates prompt_preview to 80 chars', async () => {
+    const dir = await tmpDir();
+    const env = { CURSOR_AGENT_MCP_STATE_DIR: dir };
+    const long = 'x'.repeat(200);
+    await maybeRecordSession(
+      { structuredContent: { session_id: 's1' }, userArgv: [long] },
+      { env },
+    );
+    const r = await loadRegistry({ env });
+    assert.equal(r.sessions[0].prompt_preview.length, 80);
+  });
+
+  it('maybeRecordSession no-ops when structuredContent has no session_id', async () => {
+    const dir = await tmpDir();
+    const env = { CURSOR_AGENT_MCP_STATE_DIR: dir };
+    await maybeRecordSession(
+      { structuredContent: { duration_ms: 100 }, userArgv: ['hi'] },
+      { env },
+    );
     let exists = true;
     try { await fs.stat(path.join(dir, 'sessions.json')); }
     catch (e) { if (e?.code === 'ENOENT') exists = false; else throw e; }

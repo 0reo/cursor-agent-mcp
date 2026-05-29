@@ -181,9 +181,11 @@ async function invokeCursorAgent({
          ended_at_ms: Date.now(),
        });
        // Best-effort session capture — shared with jobs.js via maybeRecordSession. Refs #1.
+       // Pass the USER argv (before buildFinalArgv appended --model/-f) so the
+       // prompt_preview is the actual prompt, not the trailing model name.
        maybeRecordSession({
          structuredContent: built.structuredContent,
-         finalArgv,
+         userArgv: argv,
        }).catch(() => {});
        resolve(built);
      } else {

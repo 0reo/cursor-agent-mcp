@@ -67,19 +67,30 @@ export async function loadRegistry({ env = process.env, home } = {}) {
 // Convenience hook used by both invokeCursorAgent and the async jobs.js
 // completion handler: if a structured result carried a session_id, persist
 // it to the registry with a prompt_preview derived from the trailing
-// non-flag entry of finalArgv. Best-effort — never throws.
-export async function maybeRecordSession({ structuredContent, finalArgv } = {}) {
+// non-flag entry of `userArgv`. Best-effort — never throws.
+//
+// IMPORTANT — pass the USER argv (the one runCursorAgent builds via
+// buildPromptArgv: [...sessionFlags, ...extra_args, prompt]), NOT the
+// finalArgv that buildFinalArgv produces. finalArgv has trailing `--model
+// <m>` / `-f` flags appended that would otherwise be mistaken for the prompt.
+export async function maybeRecordSession(
+  { structuredContent, userArgv } = {},
+  { env, home } = {},
+) {
   const sid = structuredContent?.session_id;
   if (!sid) return;
   const lastArg =
-    Array.isArray(finalArgv) && finalArgv.length
-      ? String(finalArgv[finalArgv.length - 1])
+    Array.isArray(userArgv) && userArgv.length
+      ? String(userArgv[userArgv.length - 1])
       : '';
   const prompt_preview =
     lastArg && !lastArg.startsWith('-') ? lastArg.slice(0, 80) : undefined;
-  await recordSession({
-    session_id: sid,
-    model: structuredContent?.model,
-    prompt_preview,
-  });
+  await recordSession(
+    {
+      session_id: sid,
+      model: structuredContent?.model,
+      prompt_preview,
+    },
+    { env, home },
+  );
 }
