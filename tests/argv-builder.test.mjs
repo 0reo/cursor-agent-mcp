@@ -10,6 +10,7 @@ import {
   buildFinalArgv,
   resolveTimeoutMs,
   buildStructuredResult,
+  parseModelList,
 } from '../argv-builder.js';
 
 describe('buildSessionFlags', () => {
@@ -360,5 +361,68 @@ describe('buildStructuredResult (Refs #3)', () => {
     assert.equal(r.structuredContent.session_id, 'only-id');
     assert.equal(r.structuredContent.model, undefined);
     assert.equal(r.structuredContent.usage, undefined);
+  });
+});
+
+describe('parseModelList (Refs #4)', () => {
+  it('returns { models: [] } for empty input', () => {
+    assert.deepEqual(parseModelList(''), { models: [] });
+    assert.deepEqual(parseModelList(undefined), { models: [] });
+    assert.deepEqual(parseModelList(null), { models: [] });
+  });
+
+  it('skips the header line and any blank lines', () => {
+    const out = parseModelList('Available models\n\nauto - Auto (current)\n');
+    assert.equal(out.models.length, 1);
+    assert.deepEqual(out.models[0], { id: 'auto', name: 'Auto (current)' });
+  });
+
+  it('parses multiple models from the sample format', () => {
+    const sample = [
+      'Available models',
+      '',
+      'auto - Auto (current)',
+      'gpt-5.3-codex - Codex 5.3',
+      'gpt-5.3-codex-low-fast - Codex 5.3 Low Fast',
+      'composer-2.5 - Composer 2.5',
+    ].join('\n');
+    const out = parseModelList(sample);
+    assert.equal(out.models.length, 4);
+    assert.deepEqual(out.models[0], { id: 'auto', name: 'Auto (current)' });
+    assert.deepEqual(out.models[1], { id: 'gpt-5.3-codex', name: 'Codex 5.3' });
+    assert.deepEqual(out.models[2], { id: 'gpt-5.3-codex-low-fast', name: 'Codex 5.3 Low Fast' });
+    assert.deepEqual(out.models[3], { id: 'composer-2.5', name: 'Composer 2.5' });
+  });
+
+  it('tolerates trailing/leading whitespace per line', () => {
+    const out = parseModelList('  gpt-5 - GPT 5  \n');
+    assert.deepEqual(out.models, [{ id: 'gpt-5', name: 'GPT 5' }]);
+  });
+
+  it('ignores lines that do not match the "<id> - <name>" shape', () => {
+    const text = [
+      'Available models',
+      '',
+      'just a sentence',
+      'auto - Auto',
+      '----',
+      '== section ==',
+    ].join('\n');
+    const out = parseModelList(text);
+    assert.deepEqual(out.models, [{ id: 'auto', name: 'Auto' }]);
+  });
+
+  it('treats id token strictly (no spaces, dots/dashes/underscores allowed)', () => {
+    // id with space is invalid; the dash on left of separator should be consumed by id
+    const out = parseModelList('gpt 5 - GPT 5\nfoo.bar_baz - Foo\n');
+    assert.deepEqual(out.models, [{ id: 'foo.bar_baz', name: 'Foo' }]);
+  });
+
+  it('preserves the original order from input', () => {
+    const out = parseModelList('z-model - Z\na-model - A\nm-model - M\n');
+    assert.deepEqual(
+      out.models.map((m) => m.id),
+      ['z-model', 'a-model', 'm-model'],
+    );
   });
 });

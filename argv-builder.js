@@ -128,3 +128,19 @@ export function buildStructuredResult({
     structuredContent,
   };
 }
+
+// Parse cursor-agent's `--list-models` text output into a structured list.
+// Sample line format: "auto - Auto (current)" or "gpt-5.3-codex - Codex 5.3".
+// Header ("Available models") and blank/non-matching lines are ignored.
+// Returns { models: [{id, name}, ...] } preserving input order.
+// Refs #4.
+export function parseModelList(text) {
+  const models = [];
+  if (text == null) return { models };
+  const lineRe = /^\s*([A-Za-z0-9][\w.\-]*)\s+-\s+(.+?)\s*$/;
+  for (const line of String(text).split('\n')) {
+    const m = line.match(lineRe);
+    if (m) models.push({ id: m[1], name: m[2] });
+  }
+  return { models };
+}

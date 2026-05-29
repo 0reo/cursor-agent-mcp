@@ -13,6 +13,7 @@ import {
   buildFinalArgv,
   resolveTimeoutMs,
   buildStructuredResult,
+  parseModelList,
 } from './argv-builder.js';
 
 // Tool input schema
@@ -217,6 +218,7 @@ const server = new McpServer(
        '- cursor_agent_analyze_files: prompt-based analysis of one or more paths.',
        '- cursor_agent_search_repo: prompt-based code search with include/exclude globs.',
        '- cursor_agent_plan_task: read-only planning (enforces --mode plan by default) given a goal and optional constraints.',
+       '- cursor_agent_list_models: list models advertised by the installed cursor-agent (`--list-models`); returns structuredContent.models = [{id, name}].',
        '- cursor_agent_raw: pass raw argv directly to cursor-agent; set print=false to avoid implicit --print. (Put --mode/--resume in argv yourself; typed mode/resume/continue_session are ignored here.)',
        '- cursor_agent_run: legacy single-shot chat (prompt as positional).',
        'Shared params: force (write gate, Claude-decided), mode (plan|ask — read-only; Debug/other TUI modes are NOT headless-available), resume (continue a specific chat id from a prior JSON result), continue_session (continue most recent), timeout_ms (per-call server hard timeout; default 300s).',
@@ -290,6 +292,14 @@ const RAW_SCHEMA = z.object({
   argv: z.array(z.string()).min(1, 'argv must contain at least one element'),
   print: z.boolean().optional(),
   ...COMMON,
+});
+
+// Minimal schema for list_models — only needs path / cwd / timeout overrides.
+// The COMMON write-gate / mode / output_format params don't apply to --list-models.
+const LIST_MODELS_SCHEMA = z.object({
+  cwd: z.string().optional(),
+  executable: z.string().optional(),
+  timeout_ms: z.number().int().positive().optional().describe('Per-call server hard timeout in ms. Default: 300000.'),
 });
 
 // Tools
@@ -394,6 +404,36 @@ server.tool(
       // Enforce real read-only Plan mode by default (caller may override mode explicitly).
       // This makes plan_task actually no-edit at the CLI level, not just a prompt asking for a plan.
       return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms });
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
+    }
+  },
+);
+
+// List the models cursor-agent currently advertises (`--list-models`).
+// The CLI prints a header + one "<id> - <name>" line per model; we surface
+// both the raw text and a parsed array in structuredContent.models. Refs #4.
+server.tool(
+  'cursor_agent_list_models',
+  'List models advertised by the installed cursor-agent (`--list-models`). Returns raw text plus a parsed array { id, name }[] in structuredContent.models. Use this to discover valid `model` values before issuing a chat — avoids the stale-model footgun (e.g., README\'s `gpt-5`).',
+  LIST_MODELS_SCHEMA.shape,
+  async (args) => {
+    try {
+      const { cwd, executable, timeout_ms } = args || {};
+      const result = await invokeCursorAgent({
+        argv: ['--list-models'],
+        print: false,
+        output_format: 'text',
+        cwd,
+        executable,
+        timeout_ms,
+      });
+      if (!result.isError) {
+        const text = result.content?.[0]?.text || '';
+        const { models } = parseModelList(text);
+        result.structuredContent = { ...(result.structuredContent || {}), models };
+      }
+      return result;
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
