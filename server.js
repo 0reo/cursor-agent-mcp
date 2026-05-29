@@ -49,9 +49,15 @@ function resolveExecutable(explicit) {
 * Internal executor that spawns cursor-agent with provided argv and common options.
 * Adds --print and --output-format, handles env/model/force, timeouts and idle kill.
 */
-async function invokeCursorAgent({ argv, output_format = 'text', cwd, executable, model, force, print = true, timeout_ms }) {
+async function invokeCursorAgent({
+  argv, output_format = 'text', cwd, executable, model, force, print = true, timeout_ms,
+  workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
+}) {
  const cmd = resolveExecutable(executable);
- const finalArgv = buildFinalArgv({ argv, output_format, model, force, print });
+ const finalArgv = buildFinalArgv({
+   argv, output_format, model, force, print,
+   workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
+ });
  const timeoutMs = resolveTimeoutMs({ timeout_ms });
  const startedAtMs = Date.now();
 
@@ -178,6 +184,12 @@ async function runCursorAgent(input) {
     resume,
     continue_session,
     timeout_ms,
+    workspace,
+    worktree,
+    worktree_base,
+    skip_worktree_setup,
+    sandbox,
+    trust,
   } = source || {};
 
   const argv = buildPromptArgv({ prompt, extra_args, mode, resume, continue_session });
@@ -196,7 +208,10 @@ async function runCursorAgent(input) {
     } catch {}
   }
  
-  const result = await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, timeout_ms });
+  const result = await invokeCursorAgent({
+    argv, output_format, cwd, executable, model, force, timeout_ms,
+    workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
+  });
  
   // Echo prompt either when env is set or when caller provided echo_prompt: true (if host forwards unknown args it's fine)
   const echoEnabled = process.env.CURSOR_AGENT_ECHO_PROMPT === '1' || source?.echo_prompt === true;
@@ -259,6 +274,13 @@ const COMMON = {
  // PER-CALL HARD TIMEOUT (ms). Beats CURSOR_AGENT_TIMEOUT_MS env, which beats the 5-minute default.
  // Use a SMALLER value for quick chats, a LARGER value for heavy analyze/edit calls. Refs #9.
  timeout_ms: z.number().int().positive().optional().describe('Server hard-timeout in ms for this cursor-agent call. Beats CURSOR_AGENT_TIMEOUT_MS env. Default: 300000 (5 min). On timeout the child is SIGKILL-ed and any partial stdout collected so far is returned alongside the timeout message.'),
+ // WORKSPACE SELECTION — first-class typed params for the cursor-agent workspace/worktree/sandbox/trust flags. Refs #5.
+ workspace: z.string().optional().describe('Workspace directory cursor-agent should use (--workspace). Defaults to cwd if omitted.'),
+ worktree: z.union([z.string(), z.boolean()]).optional().describe('Start in an isolated git worktree at ~/.cursor/worktrees/<reponame>/<name> (-w). true = auto-generate a name; string = use that literal name. Pairs with worktree_base and skip_worktree_setup.'),
+ worktree_base: z.string().optional().describe('Branch or ref to base the new worktree on (--worktree-base). Only meaningful when worktree is set.'),
+ skip_worktree_setup: z.boolean().optional().describe('Skip running worktree setup scripts from .cursor/worktrees.json (--skip-worktree-setup). Only meaningful when worktree is set.'),
+ sandbox: z.enum(['enabled', 'disabled']).optional().describe('Explicitly enable or disable cursor-agent sandbox mode (--sandbox), overriding the user config.'),
+ trust: z.boolean().optional().describe('Trust the current workspace without prompting (--trust). Only works with --print/headless (which this server always uses for prompt-based tools).'),
  // When true, the server will prepend the effective prompt to the tool output (useful for Claude debugging)
  echo_prompt: z.boolean().optional(),
 };
@@ -364,7 +386,7 @@ server.tool(
   EDIT_FILE_SCHEMA.shape,
   async (args) => {
     try {
-      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
+      const { file, instruction, apply, dry_run, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const composedPrompt =
         `Edit the repository file:\n` +
         `- File: ${String(file)}\n` +
@@ -372,7 +394,7 @@ server.tool(
         (apply ? `- Apply changes if safe.\n` : `- Propose a patch/diff without applying.\n`) +
         (dry_run ? `- Treat as dry-run; do not write to disk.\n` : ``) +
         (prompt ? `- Additional context: ${String(prompt)}\n` : ``);
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -385,13 +407,13 @@ server.tool(
   ANALYZE_FILES_SCHEMA.shape,
   async (args) => {
     try {
-      const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
+      const { paths, prompt, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const list = Array.isArray(paths) ? paths : [paths];
       const composedPrompt =
         `Analyze the following paths in the repository:\n` +
         list.map((p) => `- ${String(p)}`).join('\n') + '\n' +
         (prompt ? `Additional prompt: ${String(prompt)}\n` : '');
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -404,7 +426,7 @@ server.tool(
   SEARCH_REPO_SCHEMA.shape,
   async (args) => {
     try {
-      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
+      const { query, include, exclude, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const inc = include == null ? [] : (Array.isArray(include) ? include : [include]);
       const exc = exclude == null ? [] : (Array.isArray(exclude) ? exclude : [exclude]);
       const composedPrompt =
@@ -413,7 +435,7 @@ server.tool(
         (inc.length ? `- Include globs:\n${inc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         (exc.length ? `- Exclude globs:\n${exc.map((p)=>`  - ${String(p)}`).join('\n')}\n` : '') +
         `Return concise findings with file paths and line references.`;
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -426,7 +448,7 @@ server.tool(
   PLAN_TASK_SCHEMA.shape,
   async (args) => {
     try {
-      const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms } = args;
+      const { goal, constraints, output_format, cwd, executable, model, force, extra_args, mode, resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
       const cons = constraints ?? [];
       const composedPrompt =
         `Create a step-by-step plan to accomplish the following goal:\n` +
@@ -435,7 +457,7 @@ server.tool(
         `Provide a numbered list of actions.`;
       // Enforce real read-only Plan mode by default (caller may override mode explicitly).
       // This makes plan_task actually no-edit at the CLI level, not just a prompt asking for a plan.
-      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms });
+      return await runCursorAgent({ prompt: composedPrompt, output_format, extra_args, cwd, executable, model, force, mode: mode ?? 'plan', resume, continue_session, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
     } catch (e) {
       return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
     }
@@ -518,6 +540,7 @@ server.tool(
       const {
         prompt, output_format = 'text', extra_args, cwd, executable, model, force,
         mode, resume, continue_session, timeout_ms,
+        workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
       } = source || {};
       const argv = buildPromptArgv({ prompt, extra_args, mode, resume, continue_session });
       const job_id = createJob({
@@ -528,6 +551,12 @@ server.tool(
         model,
         force,
         timeout_ms,
+        workspace,
+        worktree,
+        worktree_base,
+        skip_worktree_setup,
+        sandbox,
+        trust,
       });
       const job = getJob(job_id);
       return {
@@ -565,9 +594,9 @@ server.tool(
  RAW_SCHEMA.shape,
  async (args) => {
    try {
-     const { argv, output_format, cwd, executable, model, force, timeout_ms } = args;
+     const { argv, output_format, cwd, executable, model, force, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust } = args;
      // For raw calls we disable implicit --print to allow commands like "--help"
-     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, timeout_ms });
+     return await invokeCursorAgent({ argv, output_format, cwd, executable, model, force, print: false, timeout_ms, workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust });
    } catch (e) {
      return { content: [{ type: 'text', text: `Invalid params: ${e?.message || e}` }], isError: true };
    }

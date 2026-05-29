@@ -7,6 +7,43 @@
 import path from 'node:path';
 import os from 'node:os';
 
+// Build flags for workspace/worktree/sandbox/trust selection. Refs #5.
+// Canonical emission order: --workspace, -w[/name], --worktree-base,
+// --skip-worktree-setup, --sandbox, --trust. Falsy / blank / invalid values
+// are silently skipped — cursor-agent rejects unknown enum values, so we
+// pre-validate `sandbox` here.
+export function buildWorkspaceFlags({
+  workspace,
+  worktree,
+  worktree_base,
+  skip_worktree_setup,
+  sandbox,
+  trust,
+} = {}) {
+  const flags = [];
+  if (workspace && String(workspace).trim()) {
+    flags.push('--workspace', String(workspace).trim());
+  }
+  if (worktree === true) {
+    flags.push('-w');
+  } else if (typeof worktree === 'string' && worktree.trim()) {
+    flags.push('-w', worktree.trim());
+  }
+  if (worktree_base && String(worktree_base).trim()) {
+    flags.push('--worktree-base', String(worktree_base).trim());
+  }
+  if (skip_worktree_setup === true) {
+    flags.push('--skip-worktree-setup');
+  }
+  if (sandbox === 'enabled' || sandbox === 'disabled') {
+    flags.push('--sandbox', sandbox);
+  }
+  if (trust === true) {
+    flags.push('--trust');
+  }
+  return flags;
+}
+
 // Build leading CLI flags for execution mode and session continuity.
 // `resume` (specific id) takes precedence over `continue_session` (most recent).
 export function buildSessionFlags({ mode, resume, continue_session } = {}) {
@@ -34,6 +71,12 @@ export function buildFinalArgv({
   force,
   print = true,
   env = process.env,
+  workspace,
+  worktree,
+  worktree_base,
+  skip_worktree_setup,
+  sandbox,
+  trust,
 } = {}) {
   const userArgs = [...(argv ?? [])];
   const hasModelFlag = userArgs.some(
@@ -49,8 +92,13 @@ export function buildFinalArgv({
   })();
   const effectiveForce = typeof force === 'boolean' ? force : envForce;
 
+  const workspaceFlags = buildWorkspaceFlags({
+    workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
+  });
+
   return [
     ...(print ? ['--print', '--output-format', output_format] : []),
+    ...workspaceFlags,
     ...userArgs,
     ...(hasForceFlag || !effectiveForce ? [] : ['-f']),
     ...(hasModelFlag || !effectiveModel ? [] : ['--model', effectiveModel]),

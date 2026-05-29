@@ -57,11 +57,20 @@ export function createJob(opts = {}, { spawnFn = defaultSpawn, resolveExecutable
     force,
     print = true,
     timeout_ms,
+    workspace,
+    worktree,
+    worktree_base,
+    skip_worktree_setup,
+    sandbox,
+    trust,
   } = opts;
 
   const job_id = crypto.randomUUID();
   const cmd = resolveExecutable(executable);
-  const finalArgv = buildFinalArgv({ argv, output_format, model, force, print });
+  const finalArgv = buildFinalArgv({
+    argv, output_format, model, force, print,
+    workspace, worktree, worktree_base, skip_worktree_setup, sandbox, trust,
+  });
   const timeoutMs = resolveTimeoutMs({ timeout_ms });
 
   const job = {

@@ -15,6 +15,7 @@ import {
   upsertSessionEntry,
   buildPromptArgv,
   buildJobPollResponse,
+  buildWorkspaceFlags,
 } from '../argv-builder.js';
 
 describe('buildSessionFlags', () => {
@@ -709,5 +710,123 @@ describe('buildJobPollResponse (Refs #2)', () => {
     assert.equal(r.structuredContent.status, 'failed');
     assert.equal(r.structuredContent.error, 'ENOENT: missing binary');
     assert.match(r.content[0].text, /ENOENT/);
+  });
+});
+
+describe('buildWorkspaceFlags (Refs #5)', () => {
+  it('returns [] for empty input', () => {
+    assert.deepEqual(buildWorkspaceFlags(), []);
+    assert.deepEqual(buildWorkspaceFlags({}), []);
+  });
+
+  it('emits --workspace <path> when workspace is set', () => {
+    assert.deepEqual(
+      buildWorkspaceFlags({ workspace: '/tmp/myproject' }),
+      ['--workspace', '/tmp/myproject'],
+    );
+  });
+
+  it('trims whitespace around workspace and ignores empty strings', () => {
+    assert.deepEqual(
+      buildWorkspaceFlags({ workspace: '  /tmp/x  ' }),
+      ['--workspace', '/tmp/x'],
+    );
+    assert.deepEqual(buildWorkspaceFlags({ workspace: '' }), []);
+    assert.deepEqual(buildWorkspaceFlags({ workspace: '   ' }), []);
+  });
+
+  it('emits bare -w when worktree:true (auto-name)', () => {
+    assert.deepEqual(buildWorkspaceFlags({ worktree: true }), ['-w']);
+  });
+
+  it('emits -w <name> when worktree is a string', () => {
+    assert.deepEqual(
+      buildWorkspaceFlags({ worktree: 'experiment-1' }),
+      ['-w', 'experiment-1'],
+    );
+  });
+
+  it('ignores worktree:false and empty/whitespace strings', () => {
+    assert.deepEqual(buildWorkspaceFlags({ worktree: false }), []);
+    assert.deepEqual(buildWorkspaceFlags({ worktree: '' }), []);
+    assert.deepEqual(buildWorkspaceFlags({ worktree: '   ' }), []);
+  });
+
+  it('emits --worktree-base <branch> when set', () => {
+    assert.deepEqual(
+      buildWorkspaceFlags({ worktree_base: 'main' }),
+      ['--worktree-base', 'main'],
+    );
+  });
+
+  it('emits --skip-worktree-setup when true', () => {
+    assert.deepEqual(
+      buildWorkspaceFlags({ skip_worktree_setup: true }),
+      ['--skip-worktree-setup'],
+    );
+    assert.deepEqual(buildWorkspaceFlags({ skip_worktree_setup: false }), []);
+  });
+
+  it('emits --sandbox enabled/disabled, rejects garbage', () => {
+    assert.deepEqual(
+      buildWorkspaceFlags({ sandbox: 'enabled' }),
+      ['--sandbox', 'enabled'],
+    );
+    assert.deepEqual(
+      buildWorkspaceFlags({ sandbox: 'disabled' }),
+      ['--sandbox', 'disabled'],
+    );
+    assert.deepEqual(buildWorkspaceFlags({ sandbox: 'maybe' }), []);
+    assert.deepEqual(buildWorkspaceFlags({ sandbox: '' }), []);
+  });
+
+  it('emits --trust when true (ignores falsy)', () => {
+    assert.deepEqual(buildWorkspaceFlags({ trust: true }), ['--trust']);
+    assert.deepEqual(buildWorkspaceFlags({ trust: false }), []);
+    assert.deepEqual(buildWorkspaceFlags({ trust: 'yes' }), []);
+  });
+
+  it('composes all flags in a stable canonical order', () => {
+    assert.deepEqual(
+      buildWorkspaceFlags({
+        workspace: '/tmp/x',
+        worktree: 'wt-1',
+        worktree_base: 'main',
+        skip_worktree_setup: true,
+        sandbox: 'enabled',
+        trust: true,
+      }),
+      ['--workspace', '/tmp/x', '-w', 'wt-1', '--worktree-base', 'main', '--skip-worktree-setup', '--sandbox', 'enabled', '--trust'],
+    );
+  });
+});
+
+describe('buildFinalArgv integration with workspace params (Refs #5)', () => {
+  it('threads workspace/worktree/sandbox/trust into the assembled argv', () => {
+    const argv = buildFinalArgv({
+      argv: ['prompt-text'],
+      workspace: '/tmp/p',
+      worktree: 'wt',
+      sandbox: 'enabled',
+      trust: true,
+      env: {},
+    });
+    // Order: --print, --output-format, text, <workspace flags>, <user args>
+    assert.deepEqual(argv.slice(0, 3), ['--print', '--output-format', 'text']);
+    // workspace flags appear before the user args
+    const workspaceIdx = argv.indexOf('--workspace');
+    const userIdx = argv.indexOf('prompt-text');
+    assert.ok(workspaceIdx >= 0 && userIdx >= 0 && workspaceIdx < userIdx);
+    assert.ok(argv.includes('-w'));
+    assert.ok(argv.includes('--sandbox'));
+    assert.ok(argv.includes('--trust'));
+  });
+
+  it('omits workspace flags entirely when none are provided', () => {
+    const argv = buildFinalArgv({ argv: ['hi'], env: {} });
+    assert.ok(!argv.includes('--workspace'));
+    assert.ok(!argv.includes('-w'));
+    assert.ok(!argv.includes('--sandbox'));
+    assert.ok(!argv.includes('--trust'));
   });
 });
